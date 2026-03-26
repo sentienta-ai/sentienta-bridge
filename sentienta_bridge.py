@@ -206,6 +206,46 @@ def log(msg: str, *, verbose: bool = True) -> None:
         print(msg, flush=True)
 
 
+def _supports_ansi_color() -> bool:
+    try:
+        return bool(sys.stdout and getattr(sys.stdout, "isatty", lambda: False)())
+    except Exception:
+        return False
+
+
+def _ansi_wrap(text: str, code: str) -> str:
+    if not _supports_ansi_color():
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _format_pairing_expiry_for_banner(expires_at: object) -> str:
+    try:
+        exp = float(expires_at or 0)
+    except Exception:
+        exp = 0.0
+    if exp <= 0:
+        return "Never"
+    try:
+        dt = datetime.fromtimestamp(exp, tz=timezone.utc).astimezone()
+        return dt.strftime("%Y-%m-%d %H:%M %Z")
+    except Exception:
+        return str(expires_at)
+
+
+def _print_pairing_banner(passcode: str, expires_at: object, pairing_file: Optional[Path]) -> None:
+    line = "=" * 50
+    print("", flush=True)
+    print(_ansi_wrap(line, "94;1"), flush=True)
+    print(_ansi_wrap(f"PAIRING PASSCODE: {str(passcode or '').strip()}", "94;1"), flush=True)
+    print(_ansi_wrap(f"Expires: {_format_pairing_expiry_for_banner(expires_at)}", "94"), flush=True)
+    if pairing_file is not None:
+        print(_ansi_wrap(f"Saved to: {pairing_file}", "94"), flush=True)
+    print(_ansi_wrap("Use this in Sentienta > Desktop Automation", "94"), flush=True)
+    print(_ansi_wrap(line, "94;1"), flush=True)
+    print("", flush=True)
+
+
 def auth_headers(
     *,
     auth_mode: str,
@@ -1643,9 +1683,27 @@ def _oc_extract_event_lines_from_jsonl_obj(obj: Dict[str, object]) -> List[Dict[
         msg = obj.get("message")
         if not isinstance(msg, dict):
             return out
-        role = str(msg.get("role", "") or "").strip().lower()
-        if role not in {"assistant", "toolresult"}:
-            return out
+        author = msg.get("author")
+        if not isinstance(author, dict):
+            author = {}
+        raw_role = (
+            msg.get("role")
+            or msg.get("authorRole")
+            or author.get("role")
+            or author.get("type")
+            or ""
+        )
+        raw_name = (
+            msg.get("name")
+            or author.get("name")
+            or author.get("label")
+            or author.get("displayName")
+            or ""
+        )
+        raw_role_txt = str(raw_role or "").strip().lower()
+        raw_name_txt = str(raw_name or "").strip().lower()
+        is_tool_message = raw_role_txt in {"tool", "toolresult"} or raw_name_txt in {"tool", "tools"}
+        role = "toolresult" if is_tool_message else "assistant"
         content = msg.get("content")
         if not isinstance(content, list):
             return out
@@ -3280,11 +3338,11 @@ def execute_openclaw_get_status(call: BridgeCall, pairing_state: Dict[str, objec
                             role="assistant" if txt in assistant_texts else "",
                             source="session",
                         )
-                else:
-                    # Always carry raw stdout text as a canonical payload block so
-                    # downstream formatter can preserve URLs/artifacts in dialog.
-                    if out_txt and not _oc_is_gateway_start_ack(parsed):
-                        rec_result = _oc_ensure_payload_text(rec_result, out_txt)
+                # Always carry raw stdout text as a canonical payload block so
+                # downstream formatter can preserve full multiline results even
+                # when session-event extraction only yields partial fragments.
+                if out_txt and not _oc_is_gateway_start_ack(parsed):
+                    rec_result = _oc_ensure_payload_text(rec_result, out_txt, role="assistant", source="stdout")
                 rec["result"] = rec_result
 
                 if recent_texts:
@@ -3603,9 +3661,6 @@ def main() -> int:
             "tasks": {},
         },
     }
-    exp = int(pairing_state.get("passcode_expires_at", 0) or 0)
-    exp_txt = str(exp) if exp > 0 else "never"
-    print(f"[bridge][pair] passcode={pairing_state['passcode']} expires_at={exp_txt}", flush=True)
     pairing_file = persist_pairing_code_file(bridge_id=args.bridge_id, pairing_state=pairing_state)
     if pairing_file is not None:
         print(f"[bridge][pair] pairing code file: {pairing_file}", flush=True)
@@ -3644,6 +3699,11 @@ def main() -> int:
     log(f"[bridge] started bridge_id={args.bridge_id}", verbose=True)
     log("[bridge] accepted_bridge_ids=" + ", ".join(accepted_bridge_ids), verbose=True)
     log("[bridge] selected_services=" + ", ".join(selected_services), verbose=True)
+    _print_pairing_banner(
+        str(pairing_state.get("passcode", "") or ""),
+        pairing_state.get("passcode_expires_at"),
+        pairing_file,
+    )
 
     try:
         while True:
