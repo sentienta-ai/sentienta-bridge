@@ -4,3 +4,9 @@ __pycache__/
 *.pyd
 .DS_Store
 Thumbs.db
+.env
+*.log
+.sentienta-bridge/
+enterprise-session.json
+enterprise-worker.json
+openclaw-task-cache.json

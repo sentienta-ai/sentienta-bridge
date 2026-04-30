@@ -31,13 +31,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 
 DEFAULT_QUERY_ENDPOINT = "https://v75rxsd18a.execute-api.us-west-2.amazonaws.com/PROD/query"
 DEFAULT_RETRIEVE_ENDPOINT = "https://w1e0ns2550.execute-api.us-west-2.amazonaws.com/PROD/read"
 DEFAULT_BRIDGE_ID = "desktop"
+LOCAL_BRIDGE_DEBUG_VERSION = "local-bridge-debug-2026-04-06-v2"
 SUPPORTED_SERVICES = ("openclaw_exec",)
 BRIDGE_ID_SERVICE_POLICY: Dict[str, Tuple[str, ...]] = {
     "desktop_openclaw": ("openclaw_exec",),
@@ -105,7 +106,55 @@ class ActiveQuery:
     unchanged_polls: int = 0
     openclaw_terminal_ts: float = 0.0
     openclaw_terminal_task_id: str = ""
+    current_openclaw_task_id: str = ""
     show_partial_results: bool = False
+
+
+def _bridge_debug_events(pairing_state: Dict[str, object]) -> List[Dict[str, object]]:
+    events = pairing_state.get("debug_events")
+    if isinstance(events, list):
+        return events
+    events = []
+    pairing_state["debug_events"] = events
+    return events
+
+
+def record_bridge_debug_event(
+    pairing_state: Dict[str, object],
+    stage: str,
+    *,
+    team_name: str = "",
+    query_id: str = "",
+    user_id: str = "",
+    payload: Optional[Dict[str, object]] = None,
+) -> None:
+    try:
+        events = _bridge_debug_events(pairing_state)
+        next_seq = int(pairing_state.get("debug_seq", 0) or 0) + 1
+        pairing_state["debug_seq"] = next_seq
+        query_key = f"{str(team_name or '').strip()}::{str(query_id or '').strip()}"
+        per_query = pairing_state.get("debug_query_seq")
+        if not isinstance(per_query, dict):
+            per_query = {}
+            pairing_state["debug_query_seq"] = per_query
+        next_query_seq = int(per_query.get(query_key, 0) or 0) + 1
+        per_query[query_key] = next_query_seq
+        item: Dict[str, object] = {
+            "seq": next_seq,
+            "query_seq": next_query_seq,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "stage": str(stage or "").strip(),
+            "teamName": str(team_name or "").strip(),
+            "queryID": str(query_id or "").strip(),
+            "userID": str(user_id or "").strip(),
+        }
+        if isinstance(payload, dict):
+            item["payload"] = payload
+        events.append(item)
+        if len(events) > 250:
+            del events[:-250]
+    except Exception:
+        pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -439,14 +488,17 @@ def make_registration_handler(
     class RegistrationHandler(BaseHTTPRequestHandler):
         def _json_response(self, code: int, payload: Dict[str, object]) -> None:
             raw = json.dumps(payload).encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(raw)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Bridge-Secret")
-            self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-            self.end_headers()
-            self.wfile.write(raw)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Bridge-Secret")
+                self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+                self.end_headers()
+                self.wfile.write(raw)
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+                return
 
         def do_OPTIONS(self) -> None:  # noqa: N802
             self.send_response(204)
@@ -458,6 +510,35 @@ def make_registration_handler(
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             path = parsed.path or ""
+            if path.startswith("/openclaw-media/browser/"):
+                filename = Path(unquote(path[len("/openclaw-media/browser/") :].strip())).name
+                if not filename:
+                    self._json_response(404, {"ok": False, "error": "media_not_found"})
+                    return
+                media_root = Path.home() / ".openclaw" / "media" / "browser"
+                p = (media_root / filename).resolve()
+                try:
+                    p.relative_to(media_root.resolve())
+                except Exception:
+                    self._json_response(403, {"ok": False, "error": "media_forbidden"})
+                    return
+                if not p.exists() or not p.is_file():
+                    self._json_response(404, {"ok": False, "error": "media_missing"})
+                    return
+                try:
+                    raw = p.read_bytes()
+                except Exception:
+                    self._json_response(500, {"ok": False, "error": "media_read_failed"})
+                    return
+                ctype = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Cache-Control", "private, max-age=600")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(raw)
+                return
             if path.startswith("/media/"):
                 _cleanup_expired_media_tokens(pairing_state, max_remove=400)
                 rest = path[len("/media/") :].strip()
@@ -494,6 +575,50 @@ def make_registration_handler(
                 self.end_headers()
                 self.wfile.write(raw)
                 return
+            if path == "/debug-state":
+                params = parse_qs(parsed.query or "")
+                team_filter = str((params.get("teamName") or [""])[0] or "").strip()
+                query_filter = str((params.get("queryID") or [""])[0] or "").strip()
+                user_filter = str((params.get("userID") or [""])[0] or "").strip()
+                with lock:
+                    items = [
+                        {
+                            "teamName": q.team_name,
+                            "queryID": q.query_id,
+                            "userID": q.user_id,
+                            "dialogIndex": q.dialog_index,
+                            "pollErrors": q.poll_errors,
+                            "lastSeenTs": q.last_seen_ts,
+                            "showPartialResults": bool(q.show_partial_results),
+                            "lastBodyPreview": str(q.last_body or "")[:180],
+                        }
+                        for q in active_queries.values()
+                        if (not team_filter or q.team_name == team_filter)
+                        and (not query_filter or q.query_id == query_filter)
+                        and (not user_filter or q.user_id == user_filter)
+                    ]
+                events = []
+                for event in _bridge_debug_events(pairing_state):
+                    if not isinstance(event, dict):
+                        continue
+                    if team_filter and str(event.get("teamName") or "").strip() != team_filter:
+                        continue
+                    if query_filter and str(event.get("queryID") or "").strip() != query_filter:
+                        continue
+                    if user_filter and str(event.get("userID") or "").strip() != user_filter:
+                        continue
+                    events.append(event)
+                self._json_response(
+                    200,
+                    {
+                        "ok": True,
+                        "bridgeId": bridge_id,
+                        "localBridgeDebugVersion": LOCAL_BRIDGE_DEBUG_VERSION,
+                        "activeQueries": items,
+                        "events": events[-80:],
+                    },
+                )
+                return
             if path != "/health":
                 self._json_response(404, {"ok": False, "error": "not_found"})
                 return
@@ -518,7 +643,7 @@ def make_registration_handler(
             )
 
         def do_POST(self) -> None:  # noqa: N802
-            if self.path not in {"/register-query", "/pair", "/run-tool"}:
+            if self.path not in {"/register-query", "/pair", "/unpair", "/run-tool", "/cancel-query"}:
                 self._json_response(404, {"ok": False, "error": "not_found"})
                 return
             try:
@@ -612,6 +737,35 @@ def make_registration_handler(
                     },
                 )
                 _ = persist_pairing_code_file(bridge_id=bridge_id, pairing_state=pairing_state)
+                return
+
+            if self.path == "/unpair":
+                header_secret = str(self.headers.get("X-Bridge-Secret", "")).strip()
+                payload_secret = str(payload.get("bridgeSecret", "")).strip()
+                expected_secret = str(pairing_state.get("bridge_secret", "") or "").strip()
+                if expected_secret:
+                    provided_secret = header_secret or payload_secret
+                    if not provided_secret:
+                        self._json_response(401, {"ok": False, "error": "bridge_secret_required"})
+                        return
+                    if provided_secret != expected_secret:
+                        self._json_response(401, {"ok": False, "error": "invalid_bridge_secret"})
+                        return
+
+                pairing_state["bridge_secret"] = ""
+                pairing_state["bridge_secret_expires_at"] = 0
+                pairing_state["paired_at"] = 0
+                with lock:
+                    active_queries.clear()
+                _ = persist_pairing_code_file(bridge_id=bridge_id, pairing_state=pairing_state)
+                self._json_response(
+                    200,
+                    {
+                        "ok": True,
+                        "bridgeId": bridge_id,
+                        "unpaired": True,
+                    },
+                )
                 return
 
             if self.path == "/run-tool":
@@ -723,6 +877,80 @@ def make_registration_handler(
                 )
                 return
 
+            if self.path == "/cancel-query":
+                req_bridge_id = str(payload.get("bridgeId", "") or bridge_id).strip()
+                if req_bridge_id and req_bridge_id not in accepted_bridge_ids:
+                    self._json_response(
+                        409,
+                        {
+                            "ok": False,
+                            "error": "bridge_id_mismatch",
+                            "expectedBridgeId": bridge_id,
+                            "acceptedBridgeIds": list(accepted_bridge_ids),
+                            "receivedBridgeId": req_bridge_id,
+                        },
+                    )
+                    return
+
+                header_secret = str(self.headers.get("X-Bridge-Secret", "")).strip()
+                payload_secret = str(payload.get("bridgeSecret", "")).strip()
+                expected_secret = str(pairing_state.get("bridge_secret", "") or "").strip()
+                expected_secret_expires_at = int(pairing_state.get("bridge_secret_expires_at", 0) or 0)
+                now = int(time.time())
+                if expected_secret and expected_secret_expires_at and now > expected_secret_expires_at:
+                    pairing_state["bridge_secret"] = ""
+                    pairing_state["bridge_secret_expires_at"] = 0
+                    expected_secret = ""
+
+                if expected_secret:
+                    provided_secret = header_secret or payload_secret
+                    if not provided_secret:
+                        self._json_response(401, {"ok": False, "error": "bridge_secret_required"})
+                        return
+                    if provided_secret != expected_secret:
+                        self._json_response(401, {"ok": False, "error": "invalid_bridge_secret"})
+                        return
+
+                team_name = str(payload.get("teamName", "") or "").strip()
+                query_id = str(payload.get("queryID", "") or "").strip()
+                if not team_name or not query_id:
+                    self._json_response(400, {"ok": False, "error": "teamName_and_queryID_required"})
+                    return
+
+                print(
+                    f"[bridge][cancel-query] request bridge_id={req_bridge_id or bridge_id} team={team_name} query={query_id}",
+                    flush=True,
+                )
+                try:
+                    result = cancel_openclaw_tasks_for_query(
+                        team_name=team_name,
+                        query_id=query_id,
+                        active_queries=active_queries,
+                        pairing_state=pairing_state,
+                    )
+                except BridgeError as e:
+                    print(
+                        f"[bridge][cancel-query] failed team={team_name} query={query_id} detail={str(e)}",
+                        flush=True,
+                    )
+                    self._json_response(400, {"ok": False, "error": "cancel_query_failed", "detail": str(e)})
+                    return
+
+                print(
+                    f"[bridge][cancel-query] ok team={team_name} query={query_id} canceled={len(result.get('canceled', []))}",
+                    flush=True,
+                )
+                self._json_response(
+                    200,
+                    {
+                        "ok": True,
+                        "bridgeId": bridge_id,
+                        "result": result,
+                    },
+                )
+                return
+
+            register_started = time.perf_counter()
             team_name = str(payload.get("teamName", "")).strip()
             query_id = str(payload.get("queryID", "")).strip()
             user_id = str(payload.get("userID") or payload.get("username") or "").strip()
@@ -795,6 +1023,19 @@ def make_registration_handler(
                 self._json_response(400, {"ok": False, "error": "invalid_auth", "detail": str(e)})
                 return
             merged_headers = req_headers if has_auth_credential(req_headers) else dict(default_auth_headers)
+            record_bridge_debug_event(
+                pairing_state,
+                "register_query",
+                team_name=team_name,
+                query_id=query_id,
+                user_id=user_id,
+                payload={
+                    "authMode": req_mode if has_auth_credential(req_headers) else "default",
+                    "hasAuthCredential": bool(has_auth_credential(merged_headers)),
+                    "showPartialResults": bool(show_partial_results),
+                    "requestMs": int(round((time.perf_counter() - register_started) * 1000.0)),
+                },
+            )
 
             key = (team_name, query_id)
             with lock:
@@ -816,6 +1057,17 @@ def make_registration_handler(
                     if user_id:
                         q.user_id = user_id
                     q.show_partial_results = show_partial_results
+            record_bridge_debug_event(
+                pairing_state,
+                "active_query_upserted",
+                team_name=team_name,
+                query_id=query_id,
+                user_id=user_id,
+                payload={
+                    "activeCount": len(active_queries),
+                    "requestMs": int(round((time.perf_counter() - register_started) * 1000.0)),
+                },
+            )
             self._json_response(
                 200,
                 {
@@ -910,6 +1162,7 @@ def poll_bridge_messages(
         "queryID": query_id,
         "teamName": team_name,
         "bridgeID": bridge_id,
+        "debugBridgeMessages": True,
     }
     if user_id:
         payload["userID"] = user_id
@@ -926,8 +1179,18 @@ def extract_bridge_calls_from_messages(messages: object) -> List[BridgeCall]:
     for m in messages:
         obj: Optional[Dict[str, object]] = None
         envelope_source = ""
+        envelope_meta: Dict[str, object] = {}
         if isinstance(m, dict):
             envelope_source = str(m.get("source", "") or "").strip()
+            envelope_meta = {
+                "created_at": m.get("created_at", m.get("createdAt")),
+                "claimedAt": m.get("claimedAt"),
+                "processedAt": m.get("processedAt"),
+                "queryID": m.get("queryID"),
+                "teamName": m.get("teamName"),
+                "runKey": m.get("run_key", m.get("runKey")),
+                "status": m.get("status"),
+            }
             if isinstance(m.get("payload"), dict):
                 obj = dict(m.get("payload") or {})  # outbox item shape
                 if envelope_source and not str(obj.get("source", "")).strip():
@@ -943,6 +1206,16 @@ def extract_bridge_calls_from_messages(messages: object) -> List[BridgeCall]:
             continue
         if str(obj.get("type", "")).strip() != "bridge_call":
             continue
+
+        if envelope_meta:
+            sentienta_meta = obj.get("_sentienta")
+            if not isinstance(sentienta_meta, dict):
+                sentienta_meta = {}
+            for key, value in envelope_meta.items():
+                if value is None:
+                    continue
+                sentienta_meta[key] = value
+            obj["_sentienta"] = sentienta_meta
 
         msg_id = str(obj.get("msg_id") or obj.get("call_id") or "").strip()
         if not msg_id or msg_id in seen:
@@ -1155,10 +1428,55 @@ def _oc_save_task_cache(pairing_state: Dict[str, object], cache: Dict[str, Dict[
             reverse=True,
         )[:300]
         trimmed = {k: v for k, v in items}
-        path.write_text(json.dumps(trimmed, ensure_ascii=False, indent=2), encoding="utf-8")
+        path.write_text(json.dumps(trimmed, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
         pairing_state["_oc_task_cache"] = trimmed
     except Exception as e:
         print(f"[bridge][oc] failed saving task cache: {e}", flush=True)
+
+
+def _oc_compact_result_for_cache(result_obj: object) -> Dict[str, object]:
+    try:
+        if not isinstance(result_obj, dict):
+            return {}
+        out = json.loads(json.dumps(result_obj, ensure_ascii=False))
+        if not isinstance(out, dict):
+            return {}
+        inner = out.get("result")
+        if not isinstance(inner, dict):
+            return out
+        payloads = inner.get("payloads")
+        if not isinstance(payloads, list):
+            return out
+
+        compact_payloads: List[Dict[str, object]] = []
+        for payload in payloads[:8]:
+            if not isinstance(payload, dict):
+                continue
+            entry = dict(payload)
+            text = str(entry.get("text", "") or "")
+            if len(text) > 2000:
+                entry["text"] = text[:2000] + "..."
+            compact_payloads.append(entry)
+        inner["payloads"] = compact_payloads
+        return out
+    except Exception:
+        return result_obj if isinstance(result_obj, dict) else {}
+
+
+def _oc_compact_recent_events_for_cache(events: object) -> List[Dict[str, object]]:
+    out: List[Dict[str, object]] = []
+    try:
+        for event in (events if isinstance(events, list) else [])[-10:]:
+            if not isinstance(event, dict):
+                continue
+            item = dict(event)
+            text = str(item.get("text", "") or "")
+            if len(text) > 500:
+                item["text"] = text[:500] + "..."
+            out.append(item)
+    except Exception:
+        return out
+    return out
 
 
 def _oc_persist_task_snapshot(pairing_state: Dict[str, object], rec: Dict[str, object]) -> None:
@@ -1183,13 +1501,13 @@ def _oc_persist_task_snapshot(pairing_state: Dict[str, object], rec: Dict[str, o
             "run_id": str(rec.get("run_id", "") or ""),
             "summary": str(rec.get("summary", "") or "").strip(),
             "error": str(rec.get("error", "") or "").strip(),
-            "result": rec.get("result", {}) if isinstance(rec.get("result"), dict) else {},
+            "result": _oc_compact_result_for_cache(rec.get("result", {})),
             "stdout_tail": _oc_snapshot_tail(rec, "stdout_tail", n=5),
             "stderr_tail": _oc_snapshot_tail(rec, "stderr_tail", n=5),
             "last_stdout_line": str(rec.get("last_stdout_line", "") or ""),
             "last_stderr_line": str(rec.get("last_stderr_line", "") or ""),
             "latest_event": str(rec.get("latest_event", "") or "").strip(),
-            "recent_events": rec.get("recent_events", []) if isinstance(rec.get("recent_events"), list) else [],
+            "recent_events": _oc_compact_recent_events_for_cache(rec.get("recent_events", [])),
             "session_id": str(rec.get("session_id", "") or "").strip(),
             "session_jsonl_path": str(rec.get("session_jsonl_path", "") or "").strip(),
             "session_read_pos": int(rec.get("session_read_pos", 0) or 0),
@@ -1893,6 +2211,17 @@ def _oc_capture_session_jsonl_events(rec: Dict[str, object], pairing_state: Dict
         rec["recent_events"] = recent
 
         if added > 0:
+            if str(rec.get("status", "") or "").strip().lower() == "canceled":
+                rec["post_cancel_event_count"] = int(rec.get("post_cancel_event_count", 0) or 0) + added
+                try:
+                    log(
+                        f"[bridge][oc][session-after-cancel] task_id={str(rec.get('task_id','') or '')} "
+                        f"session_id={sid} added={added} total_after_cancel={int(rec.get('post_cancel_event_count', 0) or 0)} "
+                        f"latest_len={len(str(rec.get('latest_event','') or ''))}",
+                        verbose=True,
+                    )
+                except Exception:
+                    pass
             try:
                 log(
                     f"[bridge][oc][session] task_id={str(rec.get('task_id','') or '')} "
@@ -2209,6 +2538,8 @@ def _extract_local_media_paths_from_text(text: str) -> List[str]:
             out.append(p)
     for m in nix_re.finditer(src):
         p = str(m.group(1) or "").strip()
+        if p.startswith("//"):
+            continue
         if p and p not in out:
             out.append(p)
     return out
@@ -2258,7 +2589,12 @@ def _cleanup_expired_media_tokens(pairing_state: Dict[str, object], max_remove: 
 
 
 def _stage_local_media_file(path_str: str, pairing_state: Dict[str, object]) -> Optional[Dict[str, object]]:
+    started = time.perf_counter()
     try:
+        raw = str(path_str or "").strip()
+        lowered = raw.lower()
+        if lowered.startswith(("http://", "https://", "//", "\\\\")):
+            return None
         p = Path(str(path_str or "")).expanduser()
         if not p.exists() or not p.is_file():
             return None
@@ -2299,9 +2635,20 @@ def _stage_local_media_file(path_str: str, pairing_state: Dict[str, object]) -> 
         }
     except Exception:
         return None
+    finally:
+        try:
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            if elapsed_ms >= 250:
+                log(
+                    f"[bridge][oc][media-stage] path={str(path_str or '')[:220]} elapsed_ms={elapsed_ms}",
+                    verbose=True,
+                )
+        except Exception:
+            pass
 
 
 def _augment_openclaw_result_with_media(payload: Dict[str, object], pairing_state: Dict[str, object]) -> Dict[str, object]:
+    started = time.perf_counter()
     try:
         if not isinstance(payload, dict):
             return payload
@@ -2339,6 +2686,14 @@ def _augment_openclaw_result_with_media(payload: Dict[str, object], pairing_stat
                                     candidates.append(path)
         if not candidates:
             return payload
+        try:
+            preview = [str(c)[:180] for c in candidates[:5]]
+            log(
+                f"[bridge][oc][media-augment] candidates={len(candidates)} preview={json.dumps(preview, ensure_ascii=False)}",
+                verbose=True,
+            )
+        except Exception:
+            pass
         staged: List[Dict[str, object]] = []
         for c in candidates:
             item = _stage_local_media_file(c, pairing_state)
@@ -2372,6 +2727,17 @@ def _augment_openclaw_result_with_media(payload: Dict[str, object], pairing_stat
         return payload
     except Exception:
         return payload
+    finally:
+        try:
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            if elapsed_ms >= 250:
+                media_count = len(payload.get("media", [])) if isinstance(payload, dict) and isinstance(payload.get("media"), list) else 0
+                log(
+                    f"[bridge][oc][media-augment] elapsed_ms={elapsed_ms} media_count={media_count}",
+                    verbose=True,
+                )
+        except Exception:
+            pass
 
 
 def _oc_tail_append(rec: Dict[str, object], key: str, line: str, limit: int = 80) -> None:
@@ -2546,6 +2912,90 @@ def _oc_try_early_completion(rec: Dict[str, object]) -> Tuple[bool, Dict[str, ob
     return False, {}, ""
 
 
+def _oc_stop_process(rec: Dict[str, object], *, force_tree: bool = False) -> None:
+    proc = rec.get("process")
+    if proc is None:
+        return
+    try:
+        if proc.poll() is not None:
+            return
+    except Exception:
+        pass
+
+    pid = int(getattr(proc, "pid", 0) or 0)
+    used_taskkill = False
+    if pid > 0 and os.name == "nt":
+        cmd = ["taskkill", "/PID", str(pid), "/T"]
+        if force_tree:
+            cmd.append("/F")
+        try:
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=5,
+            )
+            used_taskkill = True
+        except Exception:
+            used_taskkill = False
+
+    if not used_taskkill:
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+        except Exception:
+            pass
+
+    try:
+        proc.wait(timeout=3)
+    except Exception:
+        pass
+
+
+def _oc_send_stdin_command(rec: Dict[str, object], command: str, *, log_label: str = "") -> bool:
+    proc = rec.get("process")
+    if proc is None:
+        return False
+    try:
+        if proc.poll() is not None:
+            return False
+    except Exception:
+        pass
+    stream = getattr(proc, "stdin", None)
+    if stream is None:
+        return False
+    try:
+        cmd = str(command or "").strip()
+        if not cmd:
+            return False
+        stream.write(cmd + "\n")
+        stream.flush()
+        if log_label:
+            log(
+                f"[bridge][oc] {log_label} task_id={str(rec.get('task_id', '') or '')}",
+                verbose=True,
+            )
+        return True
+    except Exception:
+        return False
+
+
+def _oc_request_abort_via_stdin(rec: Dict[str, object]) -> bool:
+    ok = False
+    if _oc_send_stdin_command(rec, "/reset", log_label="reset requested via stdin"):
+        ok = True
+        rec["resetRequestedAt"] = int(time.time() * 1000)
+        time.sleep(0.2)
+    if _oc_send_stdin_command(rec, "/exit", log_label="exit requested via stdin"):
+        ok = True
+        rec["exitRequestedAt"] = int(time.time() * 1000)
+    return ok
+
+
 def _resolve_openclaw_cli(cli_hint: str) -> str:
     hint = str(cli_hint or "").strip()
     if hint:
@@ -2686,8 +3136,22 @@ def _oc_list_agent_ids(cli_path: str, runtime: Dict[str, object], force: bool = 
         now = int(time.time())
         cache_ids = runtime.get("known_agent_ids")
         cache_ts = int(runtime.get("known_agent_ids_ts", 0) or 0)
-        if (not force) and isinstance(cache_ids, set) and cache_ids and (now - cache_ts) < 20:
+        cache_age = max(0, now - cache_ts) if cache_ts else 0
+        cache_ttl = int(runtime.get("known_agent_ids_ttl_sec", 20) or 20)
+        cache_source = str(runtime.get("known_agent_ids_source", "") or "").strip() or "runtime"
+        if (not force) and isinstance(cache_ids, set) and cache_ids and cache_age < cache_ttl:
+            log(
+                f"[bridge][oc] agents inventory cache-hit source={cache_source} age_sec={cache_age} "
+                f"ttl_sec={cache_ttl} count={len(cache_ids)}",
+                verbose=True,
+            )
             return set(cache_ids)
+        if (not force) and isinstance(cache_ids, set) and cache_ids:
+            log(
+                f"[bridge][oc] agents inventory cache-stale source={cache_source} age_sec={cache_age} "
+                f"ttl_sec={cache_ttl} count={len(cache_ids)}",
+                verbose=True,
+            )
 
         candidates = [
             ["agents", "list", "--json"],
@@ -2695,21 +3159,30 @@ def _oc_list_agent_ids(cli_path: str, runtime: Dict[str, object], force: bool = 
         ]
         ids = set()
         for subargs in candidates:
+            started = time.perf_counter()
             rc, out, err = _oc_cli_run(cli_path, subargs, timeout_sec=20)
+            elapsed_ms = int(round((time.perf_counter() - started) * 1000.0))
             if rc == 0:
                 parsed_ids = _oc_parse_agent_ids(out)
+                log(
+                    f"[bridge][oc] agents inventory cli cmd={subargs} rc={rc} elapsed_ms={elapsed_ms} "
+                    f"parsed_count={len(parsed_ids)}",
+                    verbose=True,
+                )
                 if parsed_ids:
                     ids |= parsed_ids
                     break
             else:
                 log(
-                    f"[bridge][oc] agents list failed cmd={subargs} rc={rc} err={str(err or '')[:180]}",
+                    f"[bridge][oc] agents list failed cmd={subargs} rc={rc} elapsed_ms={elapsed_ms} "
+                    f"err={str(err or '')[:180]}",
                     verbose=True,
                 )
 
         if ids:
             runtime["known_agent_ids"] = set(ids)
             runtime["known_agent_ids_ts"] = now
+            runtime["known_agent_ids_source"] = "cli_agents_list"
         return ids
     except Exception as e:
         print("Failed in _oc_list_agent_ids", e)
@@ -2785,6 +3258,19 @@ def _oc_is_stale_auth_error(text: object) -> bool:
         return False
 
 
+def _oc_is_auth_store_error(text: object) -> bool:
+    try:
+        src = str(text or "").lower()
+        if not src:
+            return False
+        return (
+            "device-auth.json" in src
+            and ("eperm" in src or "operation not permitted" in src or "access is denied" in src)
+        )
+    except Exception:
+        return False
+
+
 def _oc_smoke_test_template_agent(
     cli_path: str,
     runtime: Dict[str, object],
@@ -2810,6 +3296,7 @@ def _oc_smoke_test_template_agent(
                 'Echo this exact message and nothing else: "SENTIENTA_OPENCLAW_TEMPLATE_OK"',
                 "--timeout",
                 "30",
+                "--json",
             ],
             timeout_sec=45,
         )
@@ -2819,6 +3306,13 @@ def _oc_smoke_test_template_agent(
             log(f"[bridge][oc] template smoke passed agent={aid}", verbose=True)
             return
         runtime.pop(cache_key, None)
+        if _oc_is_auth_store_error(combined):
+            raise BridgeError(
+                'OpenClaw could not access its auth store at '
+                '"C:\\Users\\Chris\\.openclaw\\identity\\device-auth.json" '
+                "(EPERM / access denied). Close or fix the process/file lock and verify the "
+                'OpenClaw CLI can run `openclaw agent --agent main --message "test" --json`.'
+            )
         if _oc_is_stale_auth_error(combined):
             raise BridgeError(
                 'OpenClaw main agent has stale OAuth/auth state. Refresh the OpenClaw auth for agent "main", '
@@ -2853,11 +3347,33 @@ def _oc_ensure_agent_exists(
         if not aid:
             raise BridgeError("OpenClaw agent_id is empty")
 
+        cache_ids = runtime.get("known_agent_ids")
+        cache_ts = int(runtime.get("known_agent_ids_ts", 0) or 0)
+        cache_source = str(runtime.get("known_agent_ids_source", "") or "").strip() or "runtime"
+        if isinstance(cache_ids, set) and aid in cache_ids:
+            cache_age = max(0, int(time.time()) - cache_ts) if cache_ts else 0
+            log(
+                f"[bridge][oc] trusted cached agent_id={aid} source={cache_source} age_sec={cache_age}",
+                verbose=True,
+            )
+            return
+
+        template_agent_id = str((cfg or {}).get("template_agent_id", "main") or "main").strip() or "main"
+        default_agent_id = str((cfg or {}).get("default_agent", "main") or "main").strip() or "main"
         known = _oc_list_agent_ids(cli_path, runtime, force=False)
         if aid in known:
             return
 
-        template_agent_id = str((cfg or {}).get("template_agent_id", "main") or "main").strip() or "main"
+        # Some OpenClaw installs answer direct agent prompts fine while
+        # `agents list` intermittently stalls. If the requested agent is the
+        # configured template/default agent, trust a direct smoke test instead
+        # of hard-failing on inventory enumeration.
+        if aid in {template_agent_id, default_agent_id}:
+            _oc_smoke_test_template_agent(cli_path, runtime, aid)
+            runtime["known_agent_ids"] = set(known) | {aid}
+            runtime["known_agent_ids_ts"] = int(time.time())
+            return
+
         if aid != template_agent_id:
             _oc_smoke_test_template_agent(cli_path, runtime, template_agent_id)
 
@@ -2878,6 +3394,15 @@ def _oc_ensure_agent_exists(
 
 
 def execute_openclaw_run_task(call: BridgeCall, pairing_state: Dict[str, object]) -> Dict[str, object]:
+    launch_started = time.perf_counter()
+    launch_timing: Dict[str, int] = {}
+
+    def _mark_launch_timing(name: str, start_perf: float) -> None:
+        try:
+            launch_timing[name] = int(round((time.perf_counter() - start_perf) * 1000.0))
+        except Exception:
+            pass
+
     runtime = _ensure_openclaw_runtime(pairing_state)
     tasks = runtime["tasks"]
     cfg = pairing_state.get("openclaw_config", {})
@@ -2917,8 +3442,12 @@ def execute_openclaw_run_task(call: BridgeCall, pairing_state: Dict[str, object]
         message += "\n\nContext:\n" + context.strip()
 
     cli_hint = str(cfg.get("cli_path", "openclaw") or "openclaw").strip() or "openclaw"
+    cli_start = time.perf_counter()
     cli_path = _resolve_openclaw_cli(cli_hint)
+    _mark_launch_timing("resolve_cli_ms", cli_start)
+    ensure_agent_start = time.perf_counter()
     _oc_ensure_agent_exists(cli_path, runtime, agent_id, cfg=cfg)
+    _mark_launch_timing("ensure_agent_ms", ensure_agent_start)
     session_key = ""
     run_id = ""
     effective_execution_mode = "cli"
@@ -2953,8 +3482,10 @@ def execute_openclaw_run_task(call: BridgeCall, pairing_state: Dict[str, object]
             )
         except Exception:
             pass
+        popen_start = time.perf_counter()
         proc = subprocess.Popen(
             cmd,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -2963,6 +3494,7 @@ def execute_openclaw_run_task(call: BridgeCall, pairing_state: Dict[str, object]
             bufsize=1,
             env=env,
         )
+        _mark_launch_timing("popen_ms", popen_start)
     except Exception as e:  # noqa: BLE001
         raise BridgeError(f"Failed to start OpenClaw task: {e}") from e
 
@@ -2991,6 +3523,7 @@ def execute_openclaw_run_task(call: BridgeCall, pairing_state: Dict[str, object]
         "session_read_pos": 0,
     }
     try:
+        session_bind_start = time.perf_counter()
         sid, spath = _oc_resolve_agent_session_jsonl(pairing_state, agent_id)
         if sid and spath:
             tasks[task_id]["session_id"] = sid
@@ -3001,10 +3534,25 @@ def execute_openclaw_run_task(call: BridgeCall, pairing_state: Dict[str, object]
                 f"start_pos={tasks[task_id]['session_read_pos']}",
                 verbose=True,
             )
+        _mark_launch_timing("session_bind_ms", session_bind_start)
     except Exception as e:
         print("Failed binding session jsonl on run_task", e)
+    persist_start = time.perf_counter()
     _oc_persist_task_snapshot(pairing_state, tasks[task_id])
+    _mark_launch_timing("persist_snapshot_ms", persist_start)
+    stream_start = time.perf_counter()
     _oc_start_stream_readers(proc, tasks[task_id])
+    _mark_launch_timing("start_stream_readers_ms", stream_start)
+    launch_timing["total_launch_ms"] = int(round((time.perf_counter() - launch_started) * 1000.0))
+    tasks[task_id]["launch_timing"] = dict(launch_timing)
+    try:
+        log(
+            f"[bridge][oc] run_task launch-summary task_id={task_id} "
+            f"agent={agent_id} timing={json.dumps(launch_timing, ensure_ascii=False, sort_keys=True)}",
+            verbose=True,
+        )
+    except Exception:
+        pass
 
     return {
         "tool": "openclaw.run_task",
@@ -3016,6 +3564,7 @@ def execute_openclaw_run_task(call: BridgeCall, pairing_state: Dict[str, object]
         "session_key": session_key,
         "run_id": run_id,
         "objective": objective,
+        "launch_timing": dict(launch_timing),
     }
 
 
@@ -3027,7 +3576,52 @@ def execute_openclaw_get_status(call: BridgeCall, pairing_state: Dict[str, objec
     requested_agent_id = str(args.get("agent_id") or args.get("agent") or "").strip()
     if not task_id:
         raise BridgeError("args.task_id is required")
+    log(
+        f"[bridge][oc][status-poll] start msg_id={str(call.msg_id or '').strip()} "
+        f"task_id={task_id} requested_agent={requested_agent_id or '<none>'} "
+        f"in_runtime={bool(isinstance(tasks.get(task_id), dict))}",
+        verbose=True,
+    )
+    record_bridge_debug_event(
+        pairing_state,
+        "openclaw_get_status_start",
+        payload={
+            "msgID": str(call.msg_id or "").strip(),
+            "taskID": task_id,
+            "requestedAgentID": requested_agent_id,
+            "taskInRuntime": bool(isinstance(tasks.get(task_id), dict)),
+        },
+    )
+    complete_timing: Dict[str, int] = {}
+
+    def _timed_ms(label: str, fn):
+        started = time.perf_counter()
+        result = fn()
+        complete_timing[label] = int((time.perf_counter() - started) * 1000)
+        return result
+
+    def _log_complete_timing(stage: str) -> None:
+        if not complete_timing:
+            return
+        try:
+            total_ms = sum(int(v or 0) for v in complete_timing.values())
+            details = " ".join(
+                f"{key}={int(value)}ms" for key, value in complete_timing.items()
+            )
+            log(
+                f"[bridge][oc][complete-timing] task_id={task_id} stage={stage} "
+                f"total_ms={total_ms} {details}",
+                verbose=True,
+            )
+        except Exception:
+            pass
+
     def _with_media(payload_obj: Dict[str, object]) -> Dict[str, object]:
+        if str(payload_obj.get("status", "") or "").strip().lower() == "completed":
+            return _timed_ms(
+                "augment_media_ms",
+                lambda: _augment_openclaw_result_with_media(payload_obj, pairing_state),
+            )
         return _augment_openclaw_result_with_media(payload_obj, pairing_state)
 
     rec = tasks.get(task_id)
@@ -3151,6 +3745,13 @@ def execute_openclaw_get_status(call: BridgeCall, pairing_state: Dict[str, objec
     def _return(payload_obj: Dict[str, object]) -> Dict[str, object]:
         payload_obj.setdefault("execution_mode", str(rec.get("execution_mode", "") or ""))
         payload_obj.setdefault("session_key", str(rec.get("session_key", "") or ""))
+        started = time.perf_counter()
+        if str(payload_obj.get("status", "") or "").strip().lower() == "completed":
+            _timed_ms("persist_task_snapshot_ms", lambda: _oc_persist_task_snapshot(pairing_state, rec))
+            out = _with_media(payload_obj)
+            complete_timing["return_finalize_ms"] = int((time.perf_counter() - started) * 1000)
+            _log_complete_timing("return")
+            return out
         _oc_persist_task_snapshot(pairing_state, rec)
         return _with_media(payload_obj)
     proc = rec.get("process")
@@ -3174,10 +3775,7 @@ def execute_openclaw_get_status(call: BridgeCall, pairing_state: Dict[str, objec
                 rec["updated_at"] = int(time.time())
                 rec["updated_at_ms"] = now_ms
                 rec["elapsed_ms"] = elapsed_ms
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
+                _oc_stop_process(rec)
                 _oc_join_stream_readers(rec, per_thread_timeout=0.4)
                 return _return({
                     "tool": "openclaw.get_status",
@@ -3221,10 +3819,7 @@ def execute_openclaw_get_status(call: BridgeCall, pairing_state: Dict[str, objec
                         "stdout_tail": _oc_snapshot_tail(rec, "stdout_tail", n=5),
                         "stderr_tail": _oc_snapshot_tail(rec, "stderr_tail", n=5),
                     })
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
+                _oc_stop_process(rec, force_tree=True)
                 _oc_join_stream_readers(rec, per_thread_timeout=0.4)
                 rec["status"] = "failed"
                 rec["error"] = f"OpenClaw task timed out after {timeout_ms}ms"
@@ -3291,19 +3886,19 @@ def execute_openclaw_get_status(call: BridgeCall, pairing_state: Dict[str, objec
         else:
             # Stream readers already consume stdout/stderr; avoid communicate() here
             # because it can start competing internal reader threads.
-            _oc_join_stream_readers(rec, per_thread_timeout=0.8)
+            _timed_ms("join_stream_readers_ms", lambda: _oc_join_stream_readers(rec, per_thread_timeout=0.8))
             try:
-                _oc_capture_session_jsonl_events(rec, pairing_state)
+                _timed_ms("capture_session_jsonl_ms", lambda: _oc_capture_session_jsonl_events(rec, pairing_state))
             except Exception:
                 pass
             try:
                 # Ensure late-arriving lines are captured into latest_event/recent_events
                 # before final completed/failed payload is produced.
-                _oc_capture_intermediate_events(rec)
+                _timed_ms("capture_intermediate_events_ms", lambda: _oc_capture_intermediate_events(rec))
             except Exception:
                 pass
-            streamed_out = _oc_snapshot_full(rec, "stdout_full")
-            streamed_err = _oc_snapshot_full(rec, "stderr_full")
+            streamed_out = _timed_ms("snapshot_stdout_full_ms", lambda: _oc_snapshot_full(rec, "stdout_full"))
+            streamed_err = _timed_ms("snapshot_stderr_full_ms", lambda: _oc_snapshot_full(rec, "stderr_full"))
             rec["exit_code"] = int(rc)
             rec["stdout"] = str(streamed_out or "").strip()
             rec["stderr"] = str(streamed_err or "").strip()
@@ -3314,6 +3909,7 @@ def execute_openclaw_get_status(call: BridgeCall, pairing_state: Dict[str, objec
             created_at_ms = int(rec.get("created_at_ms", created_at * 1000) or (created_at * 1000))
             rec["elapsed_ms"] = max(0, now_ms - created_at_ms)
             if rc == 0:
+                assemble_started = time.perf_counter()
                 rec["status"] = "completed"
                 out_txt = str(rec.get("stdout", "") or "").strip()
                 parsed = _try_parse_openclaw_json_output(rec["stdout"])
@@ -3355,6 +3951,7 @@ def execute_openclaw_get_status(call: BridgeCall, pairing_state: Dict[str, objec
                         or _oc_summary_from_text(out_txt)
                         or ""
                     ).strip()
+                complete_timing["assemble_completed_result_ms"] = int((time.perf_counter() - assemble_started) * 1000)
                 log(
                     f"[bridge][oc] status task_id={task_id} status=completed progress=100 "
                     f"poll_count={int(rec.get('poll_count', 0) or 0)} heartbeat_seq={int(rec.get('heartbeat_seq', 0) or 0)} "
@@ -3486,22 +4083,91 @@ def execute_openclaw_cancel_task(call: BridgeCall, pairing_state: Dict[str, obje
 
     proc = rec.get("process")
     if proc is not None:
+        _oc_request_abort_via_stdin(rec)
         try:
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except Exception:
-                proc.kill()
+            proc.wait(timeout=1.5)
         except Exception:
             pass
+        _oc_stop_process(rec, force_tree=True)
     _oc_join_stream_readers(rec, per_thread_timeout=0.4)
     rec["status"] = "canceled"
     rec["updated_at"] = int(time.time())
     rec["updated_at_ms"] = int(time.time() * 1000)
+    rec["canceled_session_id"] = str(rec.get("session_id", "") or "").strip()
+    rec["canceled_session_read_pos"] = int(rec.get("session_read_pos", 0) or 0)
+    rec["post_cancel_event_count"] = int(rec.get("post_cancel_event_count", 0) or 0)
     return {
         "tool": "openclaw.cancel_task",
         "task_id": task_id,
         "status": "canceled",
+    }
+
+
+def cancel_openclaw_tasks_for_query(
+    *,
+    team_name: str,
+    query_id: str,
+    active_queries: Dict[Tuple[str, str], ActiveQuery],
+    pairing_state: Dict[str, object],
+) -> Dict[str, object]:
+    team_txt = str(team_name or "").strip()
+    query_txt = str(query_id or "").strip()
+    if not team_txt or not query_txt:
+        raise BridgeError("teamName and queryID are required")
+
+    q = active_queries.get((team_txt, query_txt))
+    runtime = _ensure_openclaw_runtime(pairing_state)
+    tasks = runtime["tasks"]
+    canceled = []
+    already_terminal = []
+
+    target_ids = []
+    if q and str(q.current_openclaw_task_id or "").strip():
+        target_ids.append(str(q.current_openclaw_task_id).strip())
+
+    for task_id, rec in list(tasks.items()):
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("team_name", "") or "").strip() != team_txt:
+            continue
+        if str(rec.get("query_id", "") or "").strip() != query_txt:
+            continue
+        task_id_txt = str(task_id or "").strip()
+        if task_id_txt and task_id_txt not in target_ids:
+            target_ids.append(task_id_txt)
+
+    for task_id in target_ids:
+        rec = tasks.get(task_id)
+        if not isinstance(rec, dict):
+            continue
+        status = str(rec.get("status", "") or "").strip().lower()
+        if status in {"completed", "failed", "canceled"}:
+            already_terminal.append({"task_id": task_id, "status": status})
+            continue
+        execute_openclaw_cancel_task(
+            BridgeCall(
+                msg_id=f"ui-cancel-{int(time.time() * 1000)}",
+                bridge_id="desktop_openclaw",
+                tool="openclaw.cancel_task",
+                args={
+                    "task_id": task_id,
+                    "agent_id": str(rec.get("agent", "") or "main"),
+                },
+                raw={},
+            ),
+            pairing_state,
+        )
+        canceled.append({"task_id": task_id, "status": "canceled"})
+
+    if q:
+        q.current_openclaw_task_id = ""
+
+    return {
+        "tool": "openclaw.cancel_query",
+        "team_name": team_txt,
+        "query_id": query_txt,
+        "canceled": canceled,
+        "already_terminal": already_terminal,
     }
 
 
@@ -3587,8 +4253,19 @@ def post_bridge_result(
         preferred_payload["username"] = user_id
 
     try:
+        print(
+            f"[bridge][post] sending type=putBridgeMessages team={team_name} query={query_id} "
+            f"bridge_id={bridge_id} msg_id={str(result_obj.get('msg_id') or result_obj.get('call_id') or '').strip()} "
+            f"user_id={user_id or '<none>'}",
+            flush=True,
+        )
         return http_post_json(query_endpoint, preferred_payload, headers)
-    except BridgeError:
+    except BridgeError as e:
+        print(
+            f"[bridge][post] putBridgeMessages failed team={team_name} query={query_id} "
+            f"msg_id={str(result_obj.get('msg_id') or result_obj.get('call_id') or '').strip()} error={e}",
+            flush=True,
+        )
         # Fallback path: legacy appendDialogEvent.
         payload = {
             "type": "appendDialogEvent",
@@ -3599,6 +4276,11 @@ def post_bridge_result(
             "message": json.dumps(result_obj, ensure_ascii=False),
             "query": json.dumps(original_call, ensure_ascii=False),
         }
+        print(
+            f"[bridge][post] falling back type=appendDialogEvent team={team_name} query={query_id} "
+            f"msg_id={str(result_obj.get('msg_id') or result_obj.get('call_id') or '').strip()}",
+            flush=True,
+        )
         return http_post_json(query_endpoint, payload, headers)
 
 
@@ -3714,12 +4396,22 @@ def main() -> int:
             for q in snapshot:
                 poll_headers = q.auth_headers if has_auth_credential(q.auth_headers) else headers
                 if not has_auth_credential(poll_headers):
+                    record_bridge_debug_event(
+                        pairing_state,
+                        "poll_skipped_no_auth",
+                        team_name=q.team_name,
+                        query_id=q.query_id,
+                        user_id=q.user_id,
+                    )
                     continue
                 bridge_calls: List[BridgeCall] = []
                 try:
                     # New path: poll Core outbox channel for bridge-targeted messages.
                     outbox_messages: List[object] = []
                     for poll_bridge_id in accepted_bridge_ids:
+                        debug_meta: Dict[str, object] = {}
+                        backend_debug_version = ""
+                        backend_cfg_version = ""
                         outbox_resp = poll_bridge_messages(
                             query_endpoint=args.query_endpoint,
                             headers=poll_headers,
@@ -3729,19 +4421,61 @@ def main() -> int:
                             user_id=q.user_id,
                         )
                         current_messages: object = []
+                        parsed_body: Dict[str, object] = {}
+
+                        raw_body = outbox_resp.get("body")
+                        if isinstance(raw_body, str):
+                            parsed = try_load_json(raw_body)
+                            if isinstance(parsed, dict):
+                                parsed_body = parsed
+                        elif isinstance(raw_body, dict):
+                            parsed_body = raw_body
+
                         if isinstance(outbox_resp.get("messages"), list):
                             current_messages = outbox_resp.get("messages")
-                        else:
-                            raw_body = outbox_resp.get("body")
-                            parsed_body: Dict[str, object] = {}
-                            if isinstance(raw_body, str):
-                                parsed = try_load_json(raw_body)
-                                if isinstance(parsed, dict):
-                                    parsed_body = parsed
-                            elif isinstance(raw_body, dict):
-                                parsed_body = raw_body
-                            if isinstance(parsed_body.get("messages"), list):
-                                current_messages = parsed_body.get("messages")
+                        elif isinstance(parsed_body.get("messages"), list):
+                            current_messages = parsed_body.get("messages")
+
+                        if isinstance(outbox_resp.get("debug"), dict):
+                            debug_meta = outbox_resp.get("debug")
+                        elif isinstance(parsed_body.get("debug"), dict):
+                            debug_meta = parsed_body.get("debug")
+
+                        backend_debug_version = str(
+                            outbox_resp.get("backendDebugVersion")
+                            or parsed_body.get("backendDebugVersion")
+                            or ""
+                        ).strip()
+                        backend_cfg_version = str(
+                            outbox_resp.get("backendCfgVersion")
+                            or parsed_body.get("backendCfgVersion")
+                            or ""
+                        ).strip()
+                        record_bridge_debug_event(
+                            pairing_state,
+                            "poll_outbox_result",
+                            team_name=q.team_name,
+                            query_id=q.query_id,
+                            user_id=q.user_id,
+                            payload={
+                                "bridgeID": poll_bridge_id,
+                                "fetchedCount": len(current_messages) if isinstance(current_messages, list) else 0,
+                                "messages": [
+                                    {
+                                        "msgID": str((m or {}).get("msg_id") or (m or {}).get("call_id") or "").strip(),
+                                        "tool": str((m or {}).get("tool") or "").strip(),
+                                        "queryID": str((m or {}).get("_sentienta", {}).get("queryID") or "").strip() if isinstance((m or {}).get("_sentienta"), dict) else "",
+                                        "teamName": str((m or {}).get("_sentienta", {}).get("teamName") or "").strip() if isinstance((m or {}).get("_sentienta"), dict) else "",
+                                    }
+                                    for m in (current_messages[:8] if isinstance(current_messages, list) else [])
+                                    if isinstance(m, dict)
+                                ],
+                                "debug": debug_meta,
+                                "backendDebugVersion": backend_debug_version,
+                                "backendCfgVersion": backend_cfg_version,
+                                "localBridgeDebugVersion": LOCAL_BRIDGE_DEBUG_VERSION,
+                            },
+                        )
                         if isinstance(current_messages, list) and current_messages:
                             outbox_messages.extend(current_messages)
                     if args.verbose:
@@ -3769,10 +4503,29 @@ def main() -> int:
                     q.poll_errors = 0
                 except BridgeError as e:
                     q.poll_errors += 1
+                    record_bridge_debug_event(
+                        pairing_state,
+                        "poll_error",
+                        team_name=q.team_name,
+                        query_id=q.query_id,
+                        user_id=q.user_id,
+                        payload={
+                            "error": str(e),
+                            "pollErrors": q.poll_errors,
+                        },
+                    )
                     log(f"[bridge] poll error team={q.team_name} query={q.query_id}: {e}", verbose=True)
                     if q.poll_errors >= 5:
                         with active_lock:
                             active_queries.pop((q.team_name, q.query_id), None)
+                        record_bridge_debug_event(
+                            pairing_state,
+                            "query_dropped_after_poll_errors",
+                            team_name=q.team_name,
+                            query_id=q.query_id,
+                            user_id=q.user_id,
+                            payload={"pollErrors": q.poll_errors},
+                        )
                         log(f"[bridge] dropped query after repeated poll errors: team={q.team_name} query={q.query_id}", verbose=True)
                     continue
 
@@ -3830,9 +4583,51 @@ def main() -> int:
                     if dedupe_key in seen_call_ids:
                         continue
                     seen_call_ids.add(dedupe_key)
+                    sentienta_meta = call.raw.get("_sentienta") if isinstance(call.raw, dict) and isinstance(call.raw.get("_sentienta"), dict) else {}
+                    created_at = 0
+                    claimed_at = 0
+                    try:
+                        created_at = int(
+                            sentienta_meta.get("created_at")
+                            or call.raw.get("created_at")
+                            or call.raw.get("createdAt")
+                            or 0
+                        )
+                    except Exception:
+                        created_at = 0
+                    try:
+                        claimed_at = int(
+                            sentienta_meta.get("claimedAt")
+                            or call.raw.get("claimedAt")
+                            or 0
+                        )
+                    except Exception:
+                        claimed_at = 0
+                    now_epoch = int(time.time())
+                    queue_wait_s = max(0, now_epoch - created_at) if created_at else 0
+                    claim_delay_s = max(0, claimed_at - created_at) if (created_at and claimed_at) else 0
+                    post_claim_delay_s = max(0, now_epoch - claimed_at) if claimed_at else 0
+                    record_bridge_debug_event(
+                        pairing_state,
+                        "handle_call",
+                        team_name=q.team_name,
+                        query_id=q.query_id,
+                        user_id=q.user_id,
+                        payload={
+                            "msgID": call.msg_id,
+                            "tool": call.tool,
+                            "bridgeID": call.bridge_id,
+                            "queueWaitS": queue_wait_s,
+                            "claimDelayS": claim_delay_s,
+                            "postClaimDelayS": post_claim_delay_s,
+                            "createdAt": created_at,
+                            "claimedAt": claimed_at,
+                        },
+                    )
                     log(
                         f"[bridge] handling msg_id={call.msg_id} tool={call.tool} "
-                        f"bridge_id={call.bridge_id} team={q.team_name} query={q.query_id}",
+                        f"bridge_id={call.bridge_id} team={q.team_name} query={q.query_id} "
+                        f"queue_wait_s={queue_wait_s} claim_delay_s={claim_delay_s} post_claim_delay_s={post_claim_delay_s}",
                         verbose=True,
                     )
                     response_bridge_id = str(call.bridge_id or "").strip() or str(args.bridge_id)
@@ -3890,7 +4685,47 @@ def main() -> int:
                             # New run clears prior terminal marker for this query.
                             q.openclaw_terminal_ts = 0.0
                             q.openclaw_terminal_task_id = ""
+                            q.current_openclaw_task_id = str(result.get("task_id", "") or "").strip()
+                            runtime = _ensure_openclaw_runtime(pairing_state)
+                            tasks = runtime["tasks"]
+                            task_ref = tasks.get(q.current_openclaw_task_id)
+                            if isinstance(task_ref, dict):
+                                task_ref["team_name"] = q.team_name
+                                task_ref["query_id"] = q.query_id
+                        result_status = str(result.get("status", "") or "").strip() if isinstance(result, dict) else ""
+                        result_launch_timing = (
+                            dict(result.get("launch_timing") or {})
+                            if isinstance(result, dict) and isinstance(result.get("launch_timing"), dict)
+                            else {}
+                        )
+                        record_bridge_debug_event(
+                            pairing_state,
+                            "execute_call_result",
+                            team_name=q.team_name,
+                            query_id=q.query_id,
+                            user_id=q.user_id,
+                            payload={
+                                "msgID": call.msg_id,
+                                "tool": call.tool,
+                                "ok": True,
+                                "status": result_status,
+                                "launchTiming": result_launch_timing,
+                            },
+                        )
                     except BridgeError as e:
+                        record_bridge_debug_event(
+                            pairing_state,
+                            "execute_call_result",
+                            team_name=q.team_name,
+                            query_id=q.query_id,
+                            user_id=q.user_id,
+                            payload={
+                                "msgID": call.msg_id,
+                                "tool": call.tool,
+                                "ok": False,
+                                "error": str(e),
+                            },
+                        )
                         if args.verbose:
                             log(
                                 f"[bridge] result msg_id={call.msg_id} ok=False error={str(e)}",
@@ -3918,7 +4753,31 @@ def main() -> int:
                                 verbose=True,
                             )
                             log(f"[bridge] posted bridge_result msg_id={call.msg_id} resp={str(post_resp)[:160]}", verbose=True)
+                        record_bridge_debug_event(
+                            pairing_state,
+                            "post_bridge_result",
+                            team_name=q.team_name,
+                            query_id=q.query_id,
+                            user_id=q.user_id,
+                            payload={
+                                "msgID": call.msg_id,
+                                "queued": post_resp.get("queued"),
+                                "total": post_resp.get("total"),
+                                "errors": post_resp.get("errors"),
+                            },
+                        )
                     except BridgeError as e:
+                        record_bridge_debug_event(
+                            pairing_state,
+                            "post_bridge_result_error",
+                            team_name=q.team_name,
+                            query_id=q.query_id,
+                            user_id=q.user_id,
+                            payload={
+                                "msgID": call.msg_id,
+                                "error": str(e),
+                            },
+                        )
                         log(f"[bridge] failed posting bridge_result for {call.msg_id}: {e}", verbose=True)
 
                 if "EOD" in body:

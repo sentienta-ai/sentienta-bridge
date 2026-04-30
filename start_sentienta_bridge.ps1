@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = $PSScriptRoot
-$BridgeScript = Join-Path $ProjectRoot "sentienta_bridge.py"
+$BridgeScript = Join-Path $ProjectRoot "sentienta_bridge_v2.py"
 $ListenPort = 8765
 
 $OpenClawCmdPath = Join-Path $env:USERPROFILE "AppData\\Roaming\\npm\\openclaw.cmd"
