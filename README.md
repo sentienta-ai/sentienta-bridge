@@ -8,8 +8,8 @@ There are two bridge modes in this package:
 - **Desktop Bridge v2**: the normal local bridge for an individual Sentienta
   user. This is the recommended path for Teams and participant-owned Workroom
   agents.
-- **Enterprise Bridge Worker**: a headless bridge process for organization-run
-  Workroom agents. This is intended for operators and beta/enterprise users.
+- **Enterprise Bridge**: a headless bridge process for organization-run
+  Workroom agents. It is started by a Sentienta enterprise owner or admin.
 
 ## Requirements
 
@@ -19,11 +19,11 @@ Desktop Bridge v2:
 - Python 3.10+
 - OpenClaw installed and available as `openclaw` or `openclaw.cmd`
 
-Enterprise Bridge Worker:
+Enterprise Bridge:
 
 - The Desktop Bridge requirements
 - `boto3`
-- A Sentienta worker account provisioned for enterprise bridge use
+- A Sentienta account that is an active enterprise owner or admin
 
 Install the enterprise dependency with:
 
@@ -35,7 +35,7 @@ python -m pip install -r requirements-enterprise.txt
 
 - `sentienta_bridge.py`: shared bridge core and OpenClaw execution logic
 - `sentienta_bridge_v2.py`: recommended desktop bridge entrypoint
-- `sentienta_bridge_enterprise.py`: headless enterprise worker entrypoint
+- `sentienta_bridge_enterprise.py`: headless enterprise bridge entrypoint
 - `start_sentienta_bridge.ps1`: PowerShell launcher for Desktop Bridge v2
 - `start_sentienta_bridge.cmd`: Command Prompt launcher for Desktop Bridge v2
 - `requirements-enterprise.txt`: optional enterprise worker dependency list
@@ -84,26 +84,34 @@ For Workrooms, ownership still matters:
   Bridge v2
 - if the participant's bridge is offline, their desktop-backed agents are
   unavailable
-- enterprise agents run through a registered Enterprise Bridge Worker instead
+- enterprise agents run through a registered Enterprise Bridge instead
   of a participant desktop bridge
 
-## Enterprise Bridge Worker
+## Enterprise Bridge
 
-The enterprise worker is a long-running headless process. It registers itself
+The Enterprise Bridge is a long-running headless process. It registers itself
 with Sentienta, advertises available OpenClaw agents, polls for queued bridge
-jobs, executes them locally, and posts results back to Sentienta.
+jobs, executes them locally, and posts results back to Sentienta. The bridge
+uses normal Sentienta login credentials for an account that is an active owner
+or admin in the enterprise organization. The Cognito `sentienta_admin` group is
+for Sentienta platform administration and is not required to operate a customer
+enterprise bridge.
 
 Example:
 
 ```powershell
-$env:SENTIENTA_WORKER_USERNAME = "worker@example.com"
-$env:SENTIENTA_WORKER_PASSWORD = "<worker-password>"
-$env:SENTIENTA_WORKER_OWNER_USER_ID = "owner-user-id"
+$env:SENTIENTA_ADMIN_PASSWORD = "<admin-password>"
 
-python .\sentienta_bridge_enterprise.py --service openclaw_exec --verbose
+python .\sentienta_bridge_enterprise.py `
+  --admin-username admin@example.com `
+  --bridge-id bridge_acme_01 `
+  --service openclaw_exec
 ```
 
-The worker stores local configuration and session state under:
+Add `--verbose` while testing. For normal operation, omit it so the console does
+not fill with poll-debug messages.
+
+The bridge stores local configuration and session state under:
 
 ```text
 C:\Users\<username>\.sentienta-bridge\
@@ -111,23 +119,56 @@ C:\Users\<username>\.sentienta-bridge\
 
 Important files:
 
-- `enterprise-worker.json`: bridge id, worker username, owner user id
+- `enterprise-worker.json`: bridge id and local bridge configuration
 - `enterprise-session.json`: cached Cognito session tokens
 
-Do not commit these files. Do not place worker passwords in source code. Prefer
-environment variables or the `--worker-password-env` option.
+Do not commit these files. Do not place admin passwords in source code. Prefer
+environment variables or the `--admin-password-env` option.
 
-Useful enterprise options:
+Current enterprise flags:
+
+| Flag | Environment variable | Default | Notes |
+| --- | --- | --- | --- |
+| `--admin-username` | `SENTIENTA_ADMIN_USERNAME` | empty | Enterprise owner/admin login email. Legacy alias: `--worker-username`; legacy env: `SENTIENTA_WORKER_USERNAME`. |
+| `--admin-password` | `SENTIENTA_ADMIN_PASSWORD` | empty | Enterprise owner/admin login password. Legacy alias: `--worker-password`; legacy env: `SENTIENTA_WORKER_PASSWORD`. |
+| `--admin-password-env` | n/a | `SENTIENTA_ADMIN_PASSWORD` | Name of the env var to read when `--admin-password` is omitted. Legacy alias: `--worker-password-env`. |
+| `--bridge-id` | n/a | generated and persisted | Optional explicit enterprise bridge identifier, for example `bridge_acme_01`. |
+| `--service` | n/a | bridge policy / supported services | Repeatable. Current public service is `openclaw_exec`. |
+| `--poll-interval-secs` | `SENTIENTA_WORKER_POLL_INTERVAL_SECS` | `1` | Idle delay between job polls. |
+| `--heartbeat-interval-secs` | `SENTIENTA_WORKER_HEARTBEAT_INTERVAL_SECS` | `15` | Enterprise bridge heartbeat interval. |
+| `--limit` | n/a | `10` | Maximum queued jobs fetched per poll. |
+| `--once` | n/a | false | Run one poll cycle and exit. Useful for smoke tests. |
+| `--verbose` | n/a | false | Enable detailed bridge logging. |
+| `--query-endpoint` | n/a | Sentienta production query API | Override only for testing or non-production environments. |
+| `--worker-config-file` | n/a | `%USERPROFILE%\.sentienta-bridge\enterprise-worker.json` | Persisted bridge config path. |
+| `--worker-session-file` | n/a | `%USERPROFILE%\.sentienta-bridge\enterprise-session.json` | Cached Cognito session path. |
+| `--cognito-region` | `SENTIENTA_COGNITO_REGION` | `us-west-2` | Cognito region for Sentienta login. |
+| `--cognito-client-id` | `SENTIENTA_COGNITO_CLIENT_ID` | Sentienta app client id | Cognito app client id for Sentienta login. |
+| `--owner-user-id` | `SENTIENTA_WORKER_OWNER_USER_ID` | empty | Legacy override. Usually omit. |
+| `--openclaw-cli` | `SENTIENTA_OPENCLAW_CLI` | `openclaw` | OpenClaw executable path or command name. |
+| `--openclaw-default-agent` | `SENTIENTA_OPENCLAW_DEFAULT_AGENT` | `main` | Default OpenClaw agent id. |
+| `--openclaw-default-timeout-ms` | `SENTIENTA_OPENCLAW_DEFAULT_TIMEOUT_MS` | `210000` | Default OpenClaw task timeout in milliseconds. |
+| `--max-chars-default` | n/a | `40000` | Default response character limit for tool results. |
+| `--max-chars-hard` | n/a | `500000` | Hard response character limit for tool results. |
+| `--max-find-results-default` | n/a | `20` | Default result limit for find/search-style operations. |
+| `--max-find-results-hard` | n/a | `200` | Hard result limit for find/search-style operations. |
+
+Useful testing command:
 
 ```powershell
 python .\sentienta_bridge_enterprise.py `
-  --worker-username worker@example.com `
-  --owner-user-id owner-user-id `
+  --admin-username admin@example.com `
+  --bridge-id bridge_acme_01 `
   --service openclaw_exec `
-  --poll-interval-secs 1 `
+  --poll-interval-secs 5 `
   --heartbeat-interval-secs 15 `
   --verbose
 ```
+
+Legacy `--worker-username`, `--worker-password`,
+`--worker-password-env`, `SENTIENTA_WORKER_USERNAME`, and
+`SENTIENTA_WORKER_PASSWORD` values are still accepted as compatibility aliases.
+New installs should use the `admin` flag and environment variable names.
 
 ## Troubleshooting
 
@@ -154,5 +195,7 @@ healthy.
 - The bridge listens on localhost.
 - Pairing secrets and enterprise session tokens are local runtime state and
   must not be committed.
+- Enterprise Bridge API calls are authorized by the signed-in Sentienta account
+  and checked against the organization's owner/admin membership records.
 - The root/developer `sentienta_bridge_dev.py` and any `local_fs` service
   launcher are intentionally not part of this public package.

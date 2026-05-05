@@ -33,20 +33,22 @@ DEFAULT_WORKER_CONFIG_FILE = DEFAULT_WORKER_HOME / "enterprise-worker.json"
 def parse_args():
     help_epilog = (
         "Examples:\n"
-        "  # Minimal enterprise worker startup\n"
-        "  python sentienta_bridge_enterprise.py --worker-username worker@example.com --owner-user-id user_123 --service openclaw_exec\n"
+        "  # Minimal enterprise bridge startup\n"
+        "  python sentienta_bridge_enterprise.py --admin-username admin@example.com --bridge-id bridge_acme_01 --service openclaw_exec\n"
         "\n"
-        "  # Provide worker password via environment variable\n"
-        "  set SENTIENTA_WORKER_PASSWORD=secret\n"
-        "  python sentienta_bridge_enterprise.py --worker-username worker@example.com --owner-user-id user_123 --verbose\n"
+        "  # Provide admin password via environment variable\n"
+        "  set SENTIENTA_ADMIN_PASSWORD=secret\n"
+        "  python sentienta_bridge_enterprise.py --admin-username admin@example.com --bridge-id bridge_acme_01 --service openclaw_exec --verbose\n"
         "\n"
         "Notes:\n"
-        "  - Provide --worker-username and either --worker-password or the env var named by --worker-password-env.\n"
-        "  - If --service is omitted, the worker uses the bridge service policy or the currently supported service set.\n"
+        "  - Provide --admin-username and either --admin-password or the env var named by --admin-password-env.\n"
+        "  - The admin account must be an active enterprise owner/admin in Sentienta.\n"
+        "  - Legacy --worker-username / --worker-password flags still work as aliases.\n"
+        "  - If --service is omitted, the bridge uses the bridge service policy or the currently supported service set.\n"
         "  - Start OpenClaw first when using --service openclaw_exec."
     )
     p = argparse.ArgumentParser(
-        description="Headless enterprise Sentienta bridge worker for OpenClaw-backed async agents.",
+        description="Headless enterprise Sentienta bridge process for OpenClaw-backed async agents.",
         epilog=help_epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -59,7 +61,7 @@ def parse_args():
     p.add_argument(
         "--worker-config-file",
         default=str(DEFAULT_WORKER_CONFIG_FILE),
-        help=f"Path for persisted worker config JSON (default: {DEFAULT_WORKER_CONFIG_FILE}).",
+        help=f"Path for persisted enterprise bridge config JSON (default: {DEFAULT_WORKER_CONFIG_FILE}).",
     )
     p.add_argument(
         "--worker-session-file",
@@ -67,24 +69,30 @@ def parse_args():
         help=f"Path for persisted Cognito session JSON (default: {DEFAULT_WORKER_SESSION_FILE}).",
     )
     p.add_argument(
+        "--admin-username",
         "--worker-username",
-        default=os.getenv("SENTIENTA_WORKER_USERNAME", ""),
-        help="Enterprise worker username/email (or env SENTIENTA_WORKER_USERNAME).",
+        dest="admin_username",
+        default=os.getenv("SENTIENTA_ADMIN_USERNAME", "") or os.getenv("SENTIENTA_WORKER_USERNAME", ""),
+        help="Enterprise admin Sentienta login username/email (or env SENTIENTA_ADMIN_USERNAME). Legacy alias: --worker-username.",
     )
     p.add_argument(
+        "--admin-password",
         "--worker-password",
-        default=os.getenv("SENTIENTA_WORKER_PASSWORD", ""),
-        help="Enterprise worker password (or env SENTIENTA_WORKER_PASSWORD).",
+        dest="admin_password",
+        default=os.getenv("SENTIENTA_ADMIN_PASSWORD", "") or os.getenv("SENTIENTA_WORKER_PASSWORD", ""),
+        help="Enterprise admin Sentienta login password (or env SENTIENTA_ADMIN_PASSWORD). Legacy alias: --worker-password.",
     )
     p.add_argument(
+        "--admin-password-env",
         "--worker-password-env",
-        default="SENTIENTA_WORKER_PASSWORD",
-        help="Environment variable name to read the worker password from when --worker-password is omitted.",
+        dest="admin_password_env",
+        default="SENTIENTA_ADMIN_PASSWORD",
+        help="Environment variable name to read the admin password from when --admin-password is omitted.",
     )
     p.add_argument(
         "--owner-user-id",
         default=os.getenv("SENTIENTA_WORKER_OWNER_USER_ID", ""),
-        help="Sentienta owner mailbox userID for this worker (or env SENTIENTA_WORKER_OWNER_USER_ID).",
+        help="Optional legacy owner mailbox userID override. Usually omit; the authenticated admin account is used.",
     )
     p.add_argument(
         "--cognito-region",
@@ -94,7 +102,7 @@ def parse_args():
     p.add_argument(
         "--cognito-client-id",
         default=os.getenv("SENTIENTA_COGNITO_CLIENT_ID", "7r0mn4q7thj015er50ncauq7i6"),
-        help="AWS Cognito app client id for worker authentication.",
+        help="AWS Cognito app client id for enterprise bridge authentication.",
     )
     p.add_argument(
         "--poll-interval-secs",
@@ -110,7 +118,7 @@ def parse_args():
     )
     p.add_argument("--limit", type=int, default=10, help="Maximum number of queued jobs to fetch per poll (default: 10).")
     p.add_argument("--once", action="store_true", help="Run one poll cycle and then exit.")
-    p.add_argument("--verbose", action="store_true", help="Enable verbose worker logging.")
+    p.add_argument("--verbose", action="store_true", help="Enable verbose bridge logging.")
     p.add_argument(
         "--service",
         action="append",
@@ -325,13 +333,19 @@ class EnterpriseBridgeWorker:
         self.session_path = _ensure_parent(args.worker_session_file)
         self.config = _load_json_file(self.config_path)
         self.bridge_id = self._resolve_bridge_id()
-        self.owner_user_id = str(args.owner_user_id or self.config.get("ownerUserId") or "").strip()
-        password = str(args.worker_password or os.getenv(args.worker_password_env or "", "") or "").strip()
+        self.admin_username = str(args.admin_username or self.config.get("adminUsername") or self.config.get("workerUsername") or "").strip()
+        self.owner_user_id = str(args.owner_user_id or self.admin_username).strip()
+        password = str(
+            args.admin_password
+            or os.getenv(args.admin_password_env or "", "")
+            or os.getenv("SENTIENTA_WORKER_PASSWORD", "")
+            or ""
+        ).strip()
         self.session = CognitoWorkerSession(
             region=args.cognito_region,
             client_id=args.cognito_client_id,
             session_file=self.session_path,
-            username=str(args.worker_username or self.config.get("workerUsername") or "").strip(),
+            username=self.admin_username,
             password=password,
         )
         self.selected_services = resolve_selected_services(args.service, self.bridge_id)
@@ -456,8 +470,10 @@ class EnterpriseBridgeWorker:
         else:
             bridge_id = f"bridge_{platform.node().lower().replace(' ', '_')}_{uuid.uuid4().hex[:6]}"
         self.config["bridgeId"] = bridge_id
-        if self.args.worker_username:
-            self.config["workerUsername"] = str(self.args.worker_username).strip()
+        admin_username = str(getattr(self.args, "admin_username", "") or self.config.get("adminUsername") or self.config.get("workerUsername") or "").strip()
+        if admin_username:
+            self.config["adminUsername"] = admin_username
+            self.config["workerUsername"] = admin_username
         if self.args.owner_user_id:
             self.config["ownerUserId"] = str(self.args.owner_user_id).strip()
         _save_json_file(self.config_path, self.config)
