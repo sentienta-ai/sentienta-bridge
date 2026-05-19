@@ -1,5 +1,6 @@
 import argparse
 import base64
+import getpass
 import json
 import os
 import platform
@@ -236,14 +237,22 @@ def _save_json_file(path: Path, payload: Dict[str, object]) -> None:
 
 def _jwt_exp(token: str) -> int:
     try:
-        parts = str(token or "").split(".")
-        if len(parts) < 2:
-            return 0
-        padded = parts[1] + ("=" * (-len(parts[1]) % 4))
-        payload = json.loads(base64.urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8"))
+        payload = _jwt_payload(token)
         return int(payload.get("exp") or 0)
     except Exception:
         return 0
+
+
+def _jwt_payload(token: str) -> Dict[str, object]:
+    parts = str(token or "").split(".")
+    if len(parts) < 2:
+        return {}
+    padded = parts[1] + ("=" * (-len(parts[1]) % 4))
+    return json.loads(base64.urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8"))
+
+
+def _normalize_login_identifier(value: object) -> str:
+    return str(value or "").strip().lower().replace("@", "-at-")
 
 
 def _cognito_username(raw: str) -> str:
@@ -251,6 +260,23 @@ def _cognito_username(raw: str) -> str:
     if "@" in txt:
         return txt.replace("@", "-at-")
     return txt
+
+
+def _prompt_required(prompt: str, secret: bool = False, default: str = "") -> str:
+    label = str(prompt or "").strip()
+    if default:
+        label = f"{label} [{default}]"
+    label = f"{label}: "
+    try:
+        value = getpass.getpass(label) if secret else input(label)
+    except (EOFError, KeyboardInterrupt) as e:
+        raise BridgeError("Enterprise bridge startup requires interactive credentials.") from e
+    value = str(value or "").strip()
+    if not value and default:
+        value = str(default or "").strip()
+    if not value:
+        raise BridgeError("Enterprise bridge startup requires non-empty credentials.")
+    return value
 
 
 class CognitoWorkerSession:
@@ -262,6 +288,30 @@ class CognitoWorkerSession:
         self.password = str(password or "").strip()
         self.client = boto3.client("cognito-idp", region_name=self.region)
         self.state = _load_json_file(session_file)
+        self.force_password_login_once = False
+
+    def _cached_session_matches_username(self) -> bool:
+        cached_username = str(self.state.get("username") or "").strip().lower()
+        current_username = str(self.username or "").strip().lower()
+        return bool(cached_username and current_username and cached_username == current_username)
+
+    def _token_matches_username(self, token: str) -> bool:
+        payload = _jwt_payload(token)
+        expected = _normalize_login_identifier(self.username)
+        candidates = {
+            _normalize_login_identifier(payload.get("email")),
+            _normalize_login_identifier(payload.get("cognito:username")),
+            _normalize_login_identifier(payload.get("username")),
+            _normalize_login_identifier(payload.get("preferred_username")),
+        }
+        candidates.discard("")
+        return bool(expected and expected in candidates)
+
+    def update_credentials(self, username: str, password: str, clear_cached_session: bool = True):
+        self.username = str(username or "").strip()
+        self.password = str(password or "").strip()
+        if clear_cached_session:
+            self.state = {}
 
     def _store_auth_result(self, auth: Dict[str, object], refresh_token_fallback: str = ""):
         id_token = str(auth.get("IdToken") or "").strip()
@@ -296,6 +346,10 @@ class CognitoWorkerSession:
         self._store_auth_result(auth)
 
     def _refresh(self):
+        if not self._cached_session_matches_username():
+            self.state = {}
+            self._login_password()
+            return
         refresh_token = str(self.state.get("refreshToken") or "").strip()
         if not refresh_token:
             self._login_password()
@@ -311,11 +365,19 @@ class CognitoWorkerSession:
         self._store_auth_result(auth, refresh_token_fallback=refresh_token)
 
     def ensure_id_token(self) -> str:
+        if not self._cached_session_matches_username():
+            self.state = {}
+        if self.force_password_login_once and str(self.password or "").strip():
+            self.force_password_login_once = False
+            self.state = {}
+            self._login_password()
         token = str(self.state.get("idToken") or "").strip()
         expires_at = int(self.state.get("expiresAt") or 0)
         now = int(time.time())
-        if token and expires_at and now < expires_at:
+        if token and expires_at and now < expires_at and self._token_matches_username(token):
             return token
+        if token and not self._token_matches_username(token):
+            self.state = {}
         try:
             self._refresh()
         except Exception:
@@ -323,6 +385,9 @@ class CognitoWorkerSession:
         token = str(self.state.get("idToken") or "").strip()
         if not token:
             raise BridgeError("Unable to obtain Cognito id token for enterprise worker.")
+        if not self._token_matches_username(token):
+            self.state = {}
+            raise BridgeError("Cached enterprise bridge session does not match the requested admin username.")
         return token
 
 
@@ -332,8 +397,10 @@ class EnterpriseBridgeWorker:
         self.config_path = _ensure_parent(args.worker_config_file)
         self.session_path = _ensure_parent(args.worker_session_file)
         self.config = _load_json_file(self.config_path)
+        self.admin_username = str(args.admin_username or os.getenv("SENTIENTA_ADMIN_USERNAME", "") or "").strip()
+        if not self.admin_username:
+            self.admin_username = _prompt_required("Enterprise admin username")
         self.bridge_id = self._resolve_bridge_id()
-        self.admin_username = str(args.admin_username or self.config.get("adminUsername") or self.config.get("workerUsername") or "").strip()
         self.owner_user_id = str(args.owner_user_id or self.admin_username).strip()
         password = str(
             args.admin_password
@@ -348,6 +415,9 @@ class EnterpriseBridgeWorker:
             username=self.admin_username,
             password=password,
         )
+        self.session.force_password_login_once = True
+        if not self.session._cached_session_matches_username():
+            self.session.state = {}
         self.selected_services = resolve_selected_services(args.service, self.bridge_id)
         self.cached_openclaw_agents = []
         self.last_openclaw_agents_refresh = 0.0
@@ -361,6 +431,20 @@ class EnterpriseBridgeWorker:
             },
             "openclaw_runtime": {"tasks": {}},
         }
+
+    def prompt_for_credentials(self, reason: str = "", ask_username: bool = False, username_default: str = ""):
+        if reason:
+            print(f"[enterprise-bridge] {reason}", flush=True)
+        username = self.admin_username
+        if ask_username or not username:
+            username = _prompt_required("Enterprise admin username", default=username_default)
+        password = _prompt_required("Enterprise admin password", secret=True)
+        self.admin_username = username
+        self.owner_user_id = str(self.args.owner_user_id or self.admin_username).strip()
+        self.session.update_credentials(username, password, clear_cached_session=True)
+        self.config["adminUsername"] = username
+        self.config["workerUsername"] = username
+        _save_json_file(self.config_path, self.config)
 
     def _cached_openclaw_agents_snapshot(self) -> List[Dict[str, object]]:
         cached = list(self.cached_openclaw_agents or [])
@@ -512,15 +596,72 @@ class EnterpriseBridgeWorker:
 
     def _query(self, payload: Dict[str, object]) -> Dict[str, object]:
         response = self._post_query_json(payload)
+        status_code = int(response.get("statusCode") or 200) if isinstance(response, dict) else 200
         body = response.get("body")
         if isinstance(body, str):
             try:
-                return json.loads(body)
+                parsed = json.loads(body)
             except Exception:
-                return {"raw": body}
+                parsed = {"raw": body}
         if isinstance(body, dict):
-            return body
-        return response if isinstance(response, dict) else {}
+            parsed = body
+        elif not isinstance(body, str):
+            parsed = response if isinstance(response, dict) else {}
+        if status_code >= 400:
+            detail = parsed.get("message") if isinstance(parsed, dict) else parsed
+            raise BridgeError(f"Sentienta rejected enterprise bridge request: {detail or status_code}")
+        if isinstance(parsed, dict) and str(parsed.get("type") or "").strip().lower() == "error":
+            raise BridgeError(f"Sentienta rejected enterprise bridge request: {parsed.get('message') or 'error'}")
+        return parsed if isinstance(parsed, dict) else {}
+
+    def validate_enterprise_admin(self):
+        body = self._query({"type": "getMyEnterpriseContext"})
+        ctx = body.get("message") if isinstance(body.get("message"), dict) else body
+        if not isinstance(ctx, dict) or not ctx.get("hasOrg") or not ctx.get("isOrgAdmin"):
+            raise BridgeError("Enterprise bridge startup requires an active enterprise owner/admin account.")
+        return ctx
+
+    def ensure_valid_enterprise_admin(self):
+        last_error = ""
+        for attempt in range(3):
+            if not self.admin_username:
+                self.prompt_for_credentials(
+                    "Enter an active enterprise owner/admin account.",
+                    ask_username=True,
+                    username_default="",
+                )
+            elif not str(self.session.password or "").strip():
+                self.prompt_for_credentials(
+                    f"Enter the password for enterprise admin {self.admin_username}.",
+                    ask_username=False,
+                )
+            try:
+                return self.validate_enterprise_admin()
+            except Exception as e:
+                last_error = str(e)
+                if attempt >= 2:
+                    break
+                lowered = last_error.lower()
+                if "password attempts exceeded" in lowered:
+                    raise BridgeError(
+                        "Password attempts were exceeded for this admin account. Wait before trying again, "
+                        "or restart the bridge with a different enterprise admin username."
+                    ) from e
+                ask_username = (
+                    "requires an active enterprise owner/admin account" in lowered
+                    or "bridge_owner_mismatch" in lowered
+                    or "notauthorizedexception" in lowered
+                    or "incorrect username or password" in lowered
+                )
+                if ask_username:
+                    reason = "Enter a valid enterprise admin username."
+                    self.admin_username = ""
+                    self.owner_user_id = ""
+                    self.session.update_credentials("", "", clear_cached_session=True)
+                else:
+                    reason = f"Credential validation failed for {self.admin_username}. Re-enter the password."
+                self.prompt_for_credentials(reason, ask_username=ask_username, username_default="")
+        raise BridgeError(f"Enterprise bridge startup failed after credential retries: {last_error}")
 
     def register(self):
         openclaw_agents = self._refresh_openclaw_agents_cache(force=True)
@@ -769,6 +910,8 @@ class EnterpriseBridgeWorker:
     def run(self):
         verbose = bool(self.args.verbose)
         log(f"[enterprise-bridge] bridge_id={self.bridge_id} services={','.join(self.selected_services)}", verbose)
+        ctx = self.ensure_valid_enterprise_admin()
+        log(f"[enterprise-bridge] admin validated org={str((ctx.get('org') or {}).get('orgId') or '').strip()}", verbose)
         reg = self.register()
         log(f"[enterprise-bridge] register={json.dumps(reg, ensure_ascii=False)}", verbose)
         last_heartbeat = 0.0

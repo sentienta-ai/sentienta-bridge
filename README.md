@@ -87,15 +87,48 @@ For Workrooms, ownership still matters:
 - enterprise agents run through a registered Enterprise Bridge instead
   of a participant desktop bridge
 
+For Workrooms that include enterprise agents, access is stricter than ordinary
+Workroom participation:
+
+- every visible Workroom user must be an active enterprise member of the
+  organization that owns the enterprise agent
+- being in the same email domain is not enough by itself
+- contractors or outside users can participate if an enterprise owner/admin
+  explicitly adds them as active enterprise members
+- an active enterprise member can use enterprise resources in allowed Workrooms,
+  but cannot administer the organization or run the Enterprise Bridge unless
+  promoted to admin
+
+Invites use two visible roles:
+
+- `participant`: a direct invite from the Workroom host
+- `guest`: an invite from a non-host participant; the host must admit the guest
+  after the guest accepts
+
 ## Enterprise Bridge
 
 The Enterprise Bridge is a long-running headless process. It registers itself
 with Sentienta, advertises available OpenClaw agents, polls for queued bridge
 jobs, executes them locally, and posts results back to Sentienta. The bridge
 uses normal Sentienta login credentials for an account that is an active owner
-or admin in the enterprise organization. The Cognito `sentienta_admin` group is
-for Sentienta platform administration and is not required to operate a customer
-enterprise bridge.
+or admin in the enterprise organization. General Sentienta platform
+administration access is separate from customer enterprise administration.
+
+Enterprise roles:
+
+- **Owner**: created during organization setup by Sentienta platform
+  administration. The owner can open Enterprise Admin, create admins, manage
+  members/admins, and run the Enterprise Bridge. The owner should not be edited
+  or removed from Enterprise Admin.
+- **Admin**: created by an enterprise owner/admin. Admins can manage enterprise
+  members, trusted domains, and run the Enterprise Bridge.
+- **Member**: allowed to use enterprise resources, including enterprise agents
+  in Workrooms where membership is required. Members cannot administer the
+  organization and cannot run the Enterprise Bridge.
+
+Trusted domains help identify expected organization users, but trusted domain
+membership alone does not grant bridge/admin authority. Explicit owner/admin
+membership is required to run the Enterprise Bridge.
 
 Example:
 
@@ -120,10 +153,16 @@ C:\Users\<username>\.sentienta-bridge\
 Important files:
 
 - `enterprise-worker.json`: bridge id and local bridge configuration
-- `enterprise-session.json`: cached Cognito session tokens
+- `enterprise-session.json`: local sign-in session state
 
 Do not commit these files. Do not place admin passwords in source code. Prefer
 environment variables or the `--admin-password-env` option.
+
+At startup, the Enterprise Bridge validates the provided username and password
+and checks that the account is currently an active enterprise owner/admin. A
+cached local session is not enough by itself. If credentials are missing or
+invalid, the bridge prompts for valid enterprise admin credentials instead of
+starting with stale or unauthorized authority.
 
 Current enterprise flags:
 
@@ -141,9 +180,7 @@ Current enterprise flags:
 | `--verbose` | n/a | false | Enable detailed bridge logging. |
 | `--query-endpoint` | n/a | Sentienta production query API | Override only for testing or non-production environments. |
 | `--worker-config-file` | n/a | `%USERPROFILE%\.sentienta-bridge\enterprise-worker.json` | Persisted bridge config path. |
-| `--worker-session-file` | n/a | `%USERPROFILE%\.sentienta-bridge\enterprise-session.json` | Cached Cognito session path. |
-| `--cognito-region` | `SENTIENTA_COGNITO_REGION` | `us-west-2` | Cognito region for Sentienta login. |
-| `--cognito-client-id` | `SENTIENTA_COGNITO_CLIENT_ID` | Sentienta app client id | Cognito app client id for Sentienta login. |
+| `--worker-session-file` | n/a | `%USERPROFILE%\.sentienta-bridge\enterprise-session.json` | Local sign-in session path. |
 | `--owner-user-id` | `SENTIENTA_WORKER_OWNER_USER_ID` | empty | Legacy override. Usually omit. |
 | `--openclaw-cli` | `SENTIENTA_OPENCLAW_CLI` | `openclaw` | OpenClaw executable path or command name. |
 | `--openclaw-default-agent` | `SENTIENTA_OPENCLAW_DEFAULT_AGENT` | `main` | Default OpenClaw agent id. |
@@ -196,6 +233,8 @@ healthy.
 - Pairing secrets and enterprise session tokens are local runtime state and
   must not be committed.
 - Enterprise Bridge API calls are authorized by the signed-in Sentienta account
-  and checked against the organization's owner/admin membership records.
+  and checked against the organization's active owner/admin membership records.
+- Enterprise agent use in Workrooms is checked against active enterprise member
+  records for the organization that owns the enterprise agent.
 - The root/developer `sentienta_bridge_dev.py` and any `local_fs` service
   launcher are intentionally not part of this public package.
