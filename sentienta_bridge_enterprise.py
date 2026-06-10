@@ -16,13 +16,20 @@ from urllib.request import Request, urlopen
 
 from sentienta_bridge import (
     DEFAULT_QUERY_ENDPOINT,
+    MCP_PREVIEW_SERVICE,
     BridgeCall,
     BridgeError,
+    execute_approved_mcp_action,
+    _mcp_pending_approvals,
+    _public_mcp_approval_record,
+    audit_mcp_approval_decision,
     build_result,
     execute_openclaw_agents_list,
     execute_call,
+    post_mcp_approval_decision_governance_event,
     post_bridge_result,
     resolve_selected_services,
+    secret_fingerprint,
 )
 
 
@@ -123,9 +130,9 @@ def parse_args():
     p.add_argument(
         "--service",
         action="append",
-        choices=["openclaw_exec"],
+        choices=["openclaw_exec", "mcp"],
         default=[],
-        help="Enable only the specified service(s). Repeat to enable multiple. Current supported service: openclaw_exec.",
+        help="Enable only the specified service(s). Repeat to enable multiple. Supported services: openclaw_exec, mcp.",
     )
     p.add_argument(
         "--openclaw-cli",
@@ -142,6 +149,36 @@ def parse_args():
         type=int,
         default=int(os.getenv("SENTIENTA_OPENCLAW_DEFAULT_TIMEOUT_MS", "210000")),
         help="Default OpenClaw task timeout in milliseconds (default: 210000).",
+    )
+    p.add_argument(
+        "--slack-token",
+        default=os.getenv("SENTIENTA_SLACK_TOKEN", "") or os.getenv("SLACK_BOT_TOKEN", ""),
+        help="Slack bot token for enterprise MCP Slack tools, or env SENTIENTA_SLACK_TOKEN / SLACK_BOT_TOKEN.",
+    )
+    p.add_argument(
+        "--slack-default-channel",
+        default=os.getenv("SENTIENTA_SLACK_DEFAULT_CHANNEL", "") or os.getenv("SLACK_DEFAULT_CHANNEL", ""),
+        help="Default Slack channel for enterprise MCP Slack tools.",
+    )
+    p.add_argument(
+        "--github-token",
+        default=os.getenv("SENTIENTA_GITHUB_TOKEN", "") or os.getenv("GITHUB_TOKEN", ""),
+        help="GitHub token for enterprise MCP GitHub tools, or env SENTIENTA_GITHUB_TOKEN / GITHUB_TOKEN.",
+    )
+    p.add_argument(
+        "--github-default-repo",
+        default=os.getenv("SENTIENTA_GITHUB_DEFAULT_REPO", "") or os.getenv("GITHUB_DEFAULT_REPO", ""),
+        help="Default GitHub repo as owner/name for enterprise MCP GitHub tools.",
+    )
+    p.add_argument(
+        "--zapier-mcp-server-url",
+        default=os.getenv("SENTIENTA_ZAPIER_MCP_SERVER_URL", "") or os.getenv("ZAPIER_MCP_SERVER_URL", ""),
+        help="Zapier MCP server URL for enterprise MCP Zapier tools.",
+    )
+    p.add_argument(
+        "--zapier-mcp-token",
+        default=os.getenv("SENTIENTA_ZAPIER_MCP_TOKEN", "") or os.getenv("ZAPIER_MCP_TOKEN", ""),
+        help="Optional Zapier MCP bearer token for enterprise MCP Zapier tools.",
     )
     p.add_argument("--max-chars-default", type=int, default=40000, help="Default response character limit for tool results.")
     p.add_argument("--max-chars-hard", type=int, default=500000, help="Hard maximum response character limit for tool results.")
@@ -422,6 +459,7 @@ class EnterpriseBridgeWorker:
         self.cached_openclaw_agents = []
         self.last_openclaw_agents_refresh = 0.0
         self.pairing_state = {
+            "verbose": bool(args.verbose),
             "openclaw_config": {
                 "cli_path": str(args.openclaw_cli or "openclaw").strip() or "openclaw",
                 "default_agent": str(args.openclaw_default_agent or "main").strip() or "main",
@@ -430,7 +468,46 @@ class EnterpriseBridgeWorker:
                 "agents_root": str((Path.home() / ".openclaw" / "agents").resolve()),
             },
             "openclaw_runtime": {"tasks": {}},
+            "slack_config": {
+                "token": str(args.slack_token or "").strip(),
+                "default_channel": str(args.slack_default_channel or "").strip(),
+            },
+            "github_config": {
+                "token": str(args.github_token or "").strip(),
+                "default_repo": str(args.github_default_repo or "").strip(),
+            },
+            "zapier_config": {
+                "server_url": str(args.zapier_mcp_server_url or "").strip(),
+                "token": str(args.zapier_mcp_token or "").strip(),
+            },
+            "mcp_audit_events": [],
+            "mcp_pending_approvals": {},
         }
+        if args.verbose:
+            print(
+                "[enterprise-bridge][mcp-config] "
+                f"slack_token={bool(str(args.slack_token or '').strip())} "
+                f"github_token={bool(str(args.github_token or '').strip())} "
+                f"github_default_repo={bool(str(args.github_default_repo or '').strip())} "
+                f"zapier_server_url={bool(str(args.zapier_mcp_server_url or '').strip())} "
+                f"zapier_server_url_fp={secret_fingerprint(str(args.zapier_mcp_server_url or '').strip()) or '-'} "
+                f"zapier_token={bool(str(args.zapier_mcp_token or '').strip())}",
+                flush=True,
+            )
+
+    def prompt_for_credentials(self, reason: str = "", ask_username: bool = False, username_default: str = ""):
+        if reason:
+            print(f"[enterprise-bridge] {reason}", flush=True)
+        username = self.admin_username
+        if ask_username or not username:
+            username = _prompt_required("Enterprise admin username", default=username_default)
+        password = _prompt_required("Enterprise admin password", secret=True)
+        self.admin_username = username
+        self.owner_user_id = str(self.args.owner_user_id or self.admin_username).strip()
+        self.session.update_credentials(username, password, clear_cached_session=True)
+        self.config["adminUsername"] = username
+        self.config["workerUsername"] = username
+        _save_json_file(self.config_path, self.config)
 
     def prompt_for_credentials(self, reason: str = "", ask_username: bool = False, username_default: str = ""):
         if reason:
@@ -486,6 +563,10 @@ class EnterpriseBridgeWorker:
             )
 
     def _refresh_openclaw_agents_cache(self, force: bool = False) -> List[Dict[str, object]]:
+        if "openclaw_exec" not in self.selected_services:
+            self.cached_openclaw_agents = []
+            self.last_openclaw_agents_refresh = time.time()
+            return []
         now = time.time()
         if not force and (now - float(self.last_openclaw_agents_refresh or 0.0)) < 60.0:
             cached = list(self.cached_openclaw_agents or [])
@@ -793,7 +874,7 @@ class EnterpriseBridgeWorker:
                 user_id = run_key.rsplit("_", 1)[0].strip()
         call = BridgeCall(
             msg_id=msg_id or f"invalid_message_{int(time.time() * 1000)}",
-            bridge_id=str(msg.get("bridge_id") or self.bridge_id).strip(),
+            bridge_id=self.bridge_id,
             tool=tool_name or "unknown",
             args=msg.get("args") if isinstance(msg.get("args"), dict) else {},
             raw=msg,
@@ -830,16 +911,19 @@ class EnterpriseBridgeWorker:
         )
         exec_started = time.perf_counter()
         try:
-            result = execute_call(
-                call=call,
-                roots=[],
-                pairing_state=self.pairing_state,
-                selected_services=self.selected_services,
-                max_chars_default=int(self.args.max_chars_default),
-                max_chars_hard=int(self.args.max_chars_hard),
-                max_find_results_default=int(self.args.max_find_results_default),
-                max_find_results_hard=int(self.args.max_find_results_hard),
-            )
+            if call.tool == "mcp.approval.decide":
+                result = self._execute_mcp_approval_decision(call, team_name=team_name, query_id=query_id, user_id=user_id)
+            else:
+                result = execute_call(
+                    call=call,
+                    roots=[],
+                    pairing_state=self.pairing_state,
+                    selected_services=self.selected_services,
+                    max_chars_default=int(self.args.max_chars_default),
+                    max_chars_hard=int(self.args.max_chars_hard),
+                    max_find_results_default=int(self.args.max_find_results_default),
+                    max_find_results_hard=int(self.args.max_find_results_hard),
+                )
             if call.tool == "openclaw.get_status":
                 summary = _result_summary(result)
                 log(
@@ -906,6 +990,117 @@ class EnterpriseBridgeWorker:
             f"post_ms={post_duration_ms} total_worker_ms={total_worker_ms}",
             bool(self.args.verbose),
         )
+
+    def _execute_mcp_approval_decision(self, call: BridgeCall, *, team_name: str = "", query_id: str = "", user_id: str = "") -> Dict[str, object]:
+        args = call.args if isinstance(call.args, dict) else {}
+        approval_id = str(args.get("approvalID") or args.get("approval_id") or "").strip()
+        decision = str(args.get("decision") or args.get("action") or "approve").strip().lower()
+        if decision == "deny":
+            decision = "reject"
+        if not approval_id or decision not in {"approve", "reject"}:
+            raise BridgeError("approval_id_and_decision_required")
+        approvals = _mcp_pending_approvals(self.pairing_state)
+        record = approvals.get(approval_id)
+        if not isinstance(record, dict):
+            raise BridgeError(f"approval_not_found: {approval_id}")
+        if str(record.get("status") or "") != "pending":
+            return {
+                "tool": call.tool,
+                "status": "approval_not_pending",
+                "service_family": MCP_PREVIEW_SERVICE,
+                "approval": _public_mcp_approval_record(record),
+            }
+
+        from datetime import datetime, timezone
+
+        now_txt = datetime.now(timezone.utc).isoformat()
+        record["updated_at"] = now_txt
+        if decision == "reject":
+            record["status"] = "rejected"
+            record["decision"] = "rejected"
+            record["reason"] = str(args.get("reason") or "rejected_by_user")
+            audit_mcp_approval_decision(self.pairing_state, record, decision="rejected", reason=record["reason"])
+            post_mcp_approval_decision_governance_event(
+                query_endpoint=self.args.query_endpoint,
+                default_headers=self._auth_headers(),
+                active_queries={},
+                record=record,
+                decision="rejected",
+                result_status="rejected",
+            )
+            return {
+                "tool": call.tool,
+                "status": "rejected",
+                "service_family": MCP_PREVIEW_SERVICE,
+                "approval": _public_mcp_approval_record(record),
+            }
+
+        record["decision"] = "approved"
+        proposed = record.get("proposed_action") if isinstance(record.get("proposed_action"), dict) else {}
+        try:
+            execution_result = execute_approved_mcp_action(record, self.pairing_state)
+            record["status"] = "executed"
+            record["reason"] = "executed"
+            record["execution_result"] = execution_result
+            audit_mcp_approval_decision(self.pairing_state, record, decision="approved_executed", reason="executed")
+            post_mcp_approval_decision_governance_event(
+                query_endpoint=self.args.query_endpoint,
+                default_headers=self._auth_headers(),
+                active_queries={},
+                record=record,
+                decision="approved",
+                result_status="executed",
+                execution_result=execution_result,
+            )
+            return {
+                "tool": call.tool,
+                "status": "executed",
+                "service_family": MCP_PREVIEW_SERVICE,
+                "approval": _public_mcp_approval_record(record),
+                "executed": True,
+                "result": execution_result,
+            }
+            record["status"] = "approved_not_executed"
+            record["reason"] = "executor_not_configured_for_tool"
+            audit_mcp_approval_decision(self.pairing_state, record, decision="approved_not_executed", reason=record["reason"])
+            post_mcp_approval_decision_governance_event(
+                query_endpoint=self.args.query_endpoint,
+                default_headers=self._auth_headers(),
+                active_queries={},
+                record=record,
+                decision="approved",
+                result_status="approved_not_executed",
+            )
+            return {
+                "tool": call.tool,
+                "status": "approved_not_executed",
+                "service_family": MCP_PREVIEW_SERVICE,
+                "approval": _public_mcp_approval_record(record),
+                "executed": False,
+                "reason": record["reason"],
+            }
+        except BridgeError as e:
+            record["status"] = "approved_execution_failed"
+            record["reason"] = str(e)
+            audit_mcp_approval_decision(self.pairing_state, record, decision="approved_execution_failed", reason=record["reason"])
+            post_mcp_approval_decision_governance_event(
+                query_endpoint=self.args.query_endpoint,
+                default_headers=self._auth_headers(),
+                active_queries={},
+                record=record,
+                decision="approved",
+                result_status="approved_execution_failed",
+                execution_result={"error": str(e)},
+            )
+            return {
+                "tool": call.tool,
+                "status": "approved_execution_failed",
+                "service_family": MCP_PREVIEW_SERVICE,
+                "approval": _public_mcp_approval_record(record),
+                "executed": False,
+                "error": "execution_failed",
+                "reason": str(e),
+            }
 
     def run(self):
         verbose = bool(self.args.verbose)

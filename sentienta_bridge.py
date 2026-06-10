@@ -13,6 +13,7 @@ This script is intentionally conservative:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import mimetypes
@@ -27,6 +28,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from http.client import RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -39,12 +41,56 @@ DEFAULT_QUERY_ENDPOINT = "https://v75rxsd18a.execute-api.us-west-2.amazonaws.com
 DEFAULT_RETRIEVE_ENDPOINT = "https://w1e0ns2550.execute-api.us-west-2.amazonaws.com/PROD/read"
 DEFAULT_BRIDGE_ID = "desktop"
 LOCAL_BRIDGE_DEBUG_VERSION = "local-bridge-debug-2026-04-06-v2"
-SUPPORTED_SERVICES = ("openclaw_exec",)
+BRIDGE_PROTOCOL_VERSION = "bridge-protocol-v1"
+MCP_GOVERNANCE_SCHEMA_VERSION = "mcp-governance-v1"
+STABLE_BRIDGE_VERSION = "2026-06-01-stable-v1"
+MCP_PREVIEW_BRIDGE_VERSION = "2026-06-03-mcp-preview-v4"
+SUPPORTED_SERVICES = ("openclaw_exec", "mcp")
+OPENCLAW_EXEC_SERVICE = "openclaw_exec"
+DEFAULT_STABLE_SERVICES = ("openclaw_exec",)
+MCP_PREVIEW_SERVICE = "mcp"
 BRIDGE_ID_SERVICE_POLICY: Dict[str, Tuple[str, ...]] = {
     "desktop_openclaw": ("openclaw_exec",),
+    "desktop_mcp_preview": ("mcp",),
+    "desktop_mcp_slack": ("mcp",),
+    "desktop_mcp_github": ("mcp",),
+    "desktop_mcp_zapier": ("mcp",),
 }
 SERVICE_TO_BRIDGE_ID: Dict[str, str] = {
     "openclaw_exec": "desktop_openclaw",
+    "mcp": "desktop_mcp_preview",
+}
+MCP_SERVER_REGISTRY: Dict[str, Dict[str, object]] = {
+    "slack": {
+        "display_name": "Slack",
+        "bridge_id": "desktop_mcp_slack",
+        "risk_tier": "communication",
+        "status": "configured",
+        "phase_1_enabled": True,
+        "allowed_tools": ("tools.list", "status", "server.status", "channels.history", "conversations.history"),
+        "write_tools": ("messages.post", "threads.reply"),
+        "approval_required": ("messages.post",),
+    },
+    "github": {
+        "display_name": "GitHub",
+        "bridge_id": "desktop_mcp_github",
+        "risk_tier": "code_change",
+        "status": "configured",
+        "phase_1_enabled": True,
+        "allowed_tools": ("tools.list", "status", "server.status", "issues.list", "repositories.get"),
+        "write_tools": ("issues.create", "pull_requests.create"),
+        "approval_required": ("issues.create",),
+    },
+    "zapier": {
+        "display_name": "Zapier (beta)",
+        "bridge_id": "desktop_mcp_zapier",
+        "risk_tier": "automation_fanout",
+        "status": "configured",
+        "phase_1_enabled": True,
+        "allowed_tools": ("tools.list", "status", "server.status", "actions.list_enabled", "actions.discover", "actions.execute_read"),
+        "write_tools": ("actions.run", "actions.execute_write"),
+        "approval_required": ("actions.execute_write",),
+    },
 }
 MEDIA_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "pdf"}
 DEFAULT_PAIRING_FILE = Path.home() / ".sentienta-bridge" / "pairing-code.json"
@@ -86,6 +132,9 @@ def persist_pairing_code_file(
         "generated_at": now_epoch,
         "listen_port": int(pairing_state.get("listen_port", 0) or 0),
         }
+        release = pairing_state.get("bridge_release")
+        if isinstance(release, dict):
+            payload["release"] = release
         out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return out_path
     except Exception as e:
@@ -99,6 +148,7 @@ class ActiveQuery:
     query_id: str
     user_id: str = ""
     dialog_index: int = -1
+    registered_ts: float = 0.0
     last_seen_ts: float = 0.0
     poll_errors: int = 0
     auth_headers: Optional[Dict[str, str]] = None
@@ -108,6 +158,8 @@ class ActiveQuery:
     openclaw_terminal_task_id: str = ""
     current_openclaw_task_id: str = ""
     show_partial_results: bool = False
+    mcp_handled_count: int = 0
+    mcp_empty_polls_after_handled: int = 0
 
 
 def _bridge_debug_events(pairing_state: Dict[str, object]) -> List[Dict[str, object]]:
@@ -155,6 +207,27 @@ def record_bridge_debug_event(
             del events[:-250]
     except Exception:
         pass
+
+
+def record_zapier_debug_event(pairing_state: Dict[str, object], stage: str, payload: Optional[Dict[str, object]] = None) -> None:
+    scrubbed = dict(payload or {})
+    if "url" in scrubbed:
+        raw_url = str(scrubbed.get("url") or "")
+        try:
+            parsed = urlparse(raw_url)
+            scrubbed["url"] = urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "<redacted>" if parsed.query else "", ""))
+        except Exception:
+            scrubbed["url"] = "<redacted>"
+    record_bridge_debug_event(pairing_state, f"zapier_{stage}", payload=scrubbed)
+    if bool(pairing_state.get("verbose")):
+        print(f"[bridge][zapier] {stage} {json.dumps(scrubbed, ensure_ascii=False)[:800]}", flush=True)
+
+
+def secret_fingerprint(value: str) -> str:
+    txt = str(value or "")
+    if not txt:
+        return ""
+    return hashlib.sha256(txt.encode("utf-8", errors="ignore")).hexdigest()[:12]
 
 
 def parse_args() -> argparse.Namespace:
@@ -239,6 +312,36 @@ def parse_args() -> argparse.Namespace:
         choices=["cli"],
         default=os.getenv("SENTIENTA_OPENCLAW_EXECUTION_MODE", "cli"),
         help="OpenClaw execution mode for public bridge builds. Only cli is supported.",
+    )
+    p.add_argument(
+        "--slack-token",
+        default=os.getenv("SENTIENTA_SLACK_TOKEN", os.getenv("SLACK_BOT_TOKEN", "")),
+        help="Slack OAuth token for approved MCP Slack actions. Env: SENTIENTA_SLACK_TOKEN or SLACK_BOT_TOKEN.",
+    )
+    p.add_argument(
+        "--slack-default-channel",
+        default=os.getenv("SENTIENTA_SLACK_DEFAULT_CHANNEL", os.getenv("SLACK_DEFAULT_CHANNEL", "")),
+        help="Default Slack channel ID/name for approved MCP Slack messages. Env: SENTIENTA_SLACK_DEFAULT_CHANNEL or SLACK_DEFAULT_CHANNEL.",
+    )
+    p.add_argument(
+        "--github-token",
+        default=os.getenv("SENTIENTA_GITHUB_TOKEN", os.getenv("GITHUB_TOKEN", "")),
+        help="GitHub token for MCP GitHub tools. Env: SENTIENTA_GITHUB_TOKEN or GITHUB_TOKEN.",
+    )
+    p.add_argument(
+        "--github-default-repo",
+        default=os.getenv("SENTIENTA_GITHUB_DEFAULT_REPO", os.getenv("GITHUB_DEFAULT_REPO", "")),
+        help="Default GitHub repo as owner/name for MCP GitHub tools. Env: SENTIENTA_GITHUB_DEFAULT_REPO or GITHUB_DEFAULT_REPO.",
+    )
+    p.add_argument(
+        "--zapier-mcp-server-url",
+        default=os.getenv("SENTIENTA_ZAPIER_MCP_SERVER_URL", os.getenv("ZAPIER_MCP_SERVER_URL", "")),
+        help="Zapier (beta) MCP server URL. Treat this like a password. Env: SENTIENTA_ZAPIER_MCP_SERVER_URL or ZAPIER_MCP_SERVER_URL.",
+    )
+    p.add_argument(
+        "--zapier-mcp-token",
+        default=os.getenv("SENTIENTA_ZAPIER_MCP_TOKEN", os.getenv("ZAPIER_MCP_TOKEN", "")),
+        help="Optional Zapier (beta) MCP bearer token for embedded/white-label flows. Env: SENTIENTA_ZAPIER_MCP_TOKEN or ZAPIER_MCP_TOKEN.",
     )
     p.add_argument("--exit-on-eod", action="store_true", help="Stop polling when EOD appears")
     p.add_argument(
@@ -379,11 +482,47 @@ def save_json_file(path: Path, payload: Dict[str, object]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def get_mcp_preview_bridge_ids() -> List[str]:
+    ids: List[str] = ["desktop_mcp_preview"]
+    for cfg in MCP_SERVER_REGISTRY.values():
+        if not isinstance(cfg, dict):
+            continue
+        bid = str(cfg.get("bridge_id") or "").strip()
+        if bid and bid not in ids:
+            ids.append(bid)
+    return ids
+
+
+def bridge_release_metadata(bridge_id: str, selected_services: List[str], accepted_bridge_ids: List[str]) -> Dict[str, object]:
+    selected = {str(s or "").strip() for s in selected_services}
+    is_mcp_preview = MCP_PREVIEW_SERVICE in selected and "openclaw_exec" not in selected
+    if is_mcp_preview:
+        channel = "mcp-preview"
+        family = "sentienta_bridge_mcp_preview"
+        version = MCP_PREVIEW_BRIDGE_VERSION
+        governance_version = MCP_GOVERNANCE_SCHEMA_VERSION
+    else:
+        channel = "stable"
+        family = "sentienta_bridge_stable"
+        version = STABLE_BRIDGE_VERSION
+        governance_version = ""
+    return {
+        "bridgeVersion": version,
+        "bridgeChannel": channel,
+        "bridgeFamily": family,
+        "bridgeProtocolVersion": BRIDGE_PROTOCOL_VERSION,
+        "governanceSchemaVersion": governance_version,
+        "supportedServiceFamilies": list(selected_services),
+        "supportedBridgeIds": list(accepted_bridge_ids),
+        "primaryBridgeId": str(bridge_id or "").strip() or DEFAULT_BRIDGE_ID,
+    }
+
+
 def resolve_selected_services(raw_services: List[str], bridge_id: str) -> List[str]:
     bridge_key = str(bridge_id or "").strip().lower()
     policy_services = list(BRIDGE_ID_SERVICE_POLICY.get(bridge_key, ()))
     if not raw_services:
-        return policy_services if policy_services else list(SUPPORTED_SERVICES)
+        return policy_services if policy_services else list(DEFAULT_STABLE_SERVICES)
     deduped: List[str] = []
     for svc in raw_services:
         s = str(svc or "").strip()
@@ -403,6 +542,10 @@ def resolve_accepted_bridge_ids(primary_bridge_id: str, selected_services: List[
         alias = SERVICE_TO_BRIDGE_ID.get(str(svc or "").strip())
         if alias and alias not in ids:
             ids.append(alias)
+        if str(svc or "").strip() == MCP_PREVIEW_SERVICE:
+            for bid in get_mcp_preview_bridge_ids():
+                if bid not in ids:
+                    ids.append(bid)
     return ids
 
 
@@ -434,6 +577,8 @@ def compute_available_services(selected_services: List[str]) -> List[str]:
     services: List[str] = []
     if "openclaw_exec" in selected_services:
         services.append("openclaw_exec")
+    if MCP_PREVIEW_SERVICE in selected_services:
+        services.append(MCP_PREVIEW_SERVICE)
     return services
 
 
@@ -476,6 +621,7 @@ def make_registration_handler(
     active_queries: Dict[Tuple[str, str], ActiveQuery],
     lock: threading.Lock,
     default_auth_headers: Dict[str, str],
+    query_endpoint: str,
     pairing_state: Dict[str, object],
     roots: List[Path],
     selected_services: List[str],
@@ -588,6 +734,7 @@ def make_registration_handler(
                             "userID": q.user_id,
                             "dialogIndex": q.dialog_index,
                             "pollErrors": q.poll_errors,
+                            "registeredTs": q.registered_ts,
                             "lastSeenTs": q.last_seen_ts,
                             "showPartialResults": bool(q.show_partial_results),
                             "lastBodyPreview": str(q.last_body or "")[:180],
@@ -614,8 +761,29 @@ def make_registration_handler(
                         "ok": True,
                         "bridgeId": bridge_id,
                         "localBridgeDebugVersion": LOCAL_BRIDGE_DEBUG_VERSION,
+                        "release": bridge_release_metadata(bridge_id, selected_services, accepted_bridge_ids),
                         "activeQueries": items,
                         "events": events[-80:],
+                        "mcpAuditEvents": _mcp_audit_events(pairing_state)[-80:],
+                        "mcpPendingApprovals": [
+                            _public_mcp_approval_record(record)
+                            for record in _mcp_pending_approvals(pairing_state).values()
+                            if str((record or {}).get("status") or "") == "pending"
+                        ][-80:],
+                        "mcpExecutionConfig": {
+                            "slack": {
+                                "tokenConfigured": bool(str((pairing_state.get("slack_config") or {}).get("token") or "").strip()),
+                                "defaultChannelConfigured": bool(str((pairing_state.get("slack_config") or {}).get("default_channel") or "").strip()),
+                            },
+                            "github": {
+                                "tokenConfigured": bool(str((pairing_state.get("github_config") or {}).get("token") or "").strip()),
+                                "defaultRepoConfigured": bool(str((pairing_state.get("github_config") or {}).get("default_repo") or "").strip()),
+                            },
+                            "zapier": {
+                                "serverUrlConfigured": bool(str((pairing_state.get("zapier_config") or {}).get("server_url") or "").strip()),
+                                "tokenConfigured": bool(str((pairing_state.get("zapier_config") or {}).get("token") or "").strip()),
+                            }
+                        },
                     },
                 )
                 return
@@ -629,12 +797,14 @@ def make_registration_handler(
                     for q in active_queries.values()
                 ]
             available_services = compute_available_services(selected_services)
+            release_meta = bridge_release_metadata(bridge_id, selected_services, accepted_bridge_ids)
             self._json_response(
                 200,
                 {
                     "ok": True,
                     "bridgeId": bridge_id,
                     "acceptedBridgeIds": list(accepted_bridge_ids),
+                    "release": release_meta,
                     "activeQueries": items,
                     "paired": bool(pairing_state.get("bridge_secret")),
                     "bridgeSecretExpiresAt": int(pairing_state.get("bridge_secret_expires_at", 0) or 0),
@@ -643,7 +813,7 @@ def make_registration_handler(
             )
 
         def do_POST(self) -> None:  # noqa: N802
-            if self.path not in {"/register-query", "/pair", "/unpair", "/run-tool", "/cancel-query"}:
+            if self.path not in {"/register-query", "/pair", "/unpair", "/run-tool", "/cancel-query", "/mcp-approval"}:
                 self._json_response(404, {"ok": False, "error": "not_found"})
                 return
             try:
@@ -705,6 +875,8 @@ def make_registration_handler(
                 cap_to_service = {
                     "openclaw": "openclaw_exec",
                     "openclaw_exec": "openclaw_exec",
+                    "mcp": "mcp",
+                    "mcp_preview": "mcp",
                 }
                 requested_services = [cap_to_service[c] for c in requested_caps if c in cap_to_service]
                 enabled_bridge_ids: List[str] = []
@@ -724,12 +896,14 @@ def make_registration_handler(
                 pairing_state["pair_failures"] = []
 
                 available_services = compute_available_services(selected_services)
+                release_meta = bridge_release_metadata(bridge_id, selected_services, accepted_bridge_ids)
                 self._json_response(
                     200,
                     {
                         "ok": True,
                         "bridgeId": bridge_id,
                         "acceptedBridgeIds": list(accepted_bridge_ids),
+                        "release": release_meta,
                         "bridgeSecret": bridge_secret,
                         "enabledBridgeIds": enabled_bridge_ids,
                         "availableServices": list(available_services),
@@ -950,6 +1124,165 @@ def make_registration_handler(
                 )
                 return
 
+            if self.path == "/mcp-approval":
+                req_bridge_id = str(payload.get("bridgeId", "") or bridge_id).strip()
+                if req_bridge_id and req_bridge_id not in accepted_bridge_ids:
+                    self._json_response(
+                        409,
+                        {
+                            "ok": False,
+                            "error": "bridge_id_mismatch",
+                            "expectedBridgeId": bridge_id,
+                            "acceptedBridgeIds": list(accepted_bridge_ids),
+                            "receivedBridgeId": req_bridge_id,
+                        },
+                    )
+                    return
+
+                header_secret = str(self.headers.get("X-Bridge-Secret", "")).strip()
+                payload_secret = str(payload.get("bridgeSecret", "")).strip()
+                expected_secret = str(pairing_state.get("bridge_secret", "") or "").strip()
+                expected_secret_expires_at = int(pairing_state.get("bridge_secret_expires_at", 0) or 0)
+                now = int(time.time())
+                if expected_secret and expected_secret_expires_at and now > expected_secret_expires_at:
+                    pairing_state["bridge_secret"] = ""
+                    pairing_state["bridge_secret_expires_at"] = 0
+                    expected_secret = ""
+
+                if expected_secret:
+                    provided_secret = header_secret or payload_secret
+                    if not provided_secret:
+                        self._json_response(401, {"ok": False, "error": "bridge_secret_required"})
+                        return
+                    if provided_secret != expected_secret:
+                        self._json_response(401, {"ok": False, "error": "invalid_bridge_secret"})
+                        return
+
+                approval_id = str(payload.get("approvalID") or payload.get("approval_id") or "").strip()
+                decision = str(payload.get("decision") or payload.get("action") or "").strip().lower()
+                if decision == "deny":
+                    decision = "reject"
+                if not approval_id or decision not in {"approve", "reject"}:
+                    self._json_response(400, {"ok": False, "error": "approval_id_and_decision_required"})
+                    return
+                approvals = _mcp_pending_approvals(pairing_state)
+                record = approvals.get(approval_id)
+                if not isinstance(record, dict):
+                    self._json_response(404, {"ok": False, "error": "approval_not_found", "approvalID": approval_id})
+                    return
+                if str(record.get("status") or "") != "pending":
+                    self._json_response(
+                        409,
+                        {
+                            "ok": False,
+                            "error": "approval_not_pending",
+                            "approval": _public_mcp_approval_record(record),
+                        },
+                    )
+                    return
+
+                now_txt = datetime.now(timezone.utc).isoformat()
+                if decision == "reject":
+                    record["status"] = "rejected"
+                    record["updated_at"] = now_txt
+                    record["decision"] = "rejected"
+                    record["reason"] = str(payload.get("reason") or "rejected_by_user")
+                    audit_mcp_approval_decision(pairing_state, record, decision="rejected", reason=record["reason"])
+                    post_mcp_approval_decision_governance_event(
+                        query_endpoint=query_endpoint,
+                        default_headers=default_auth_headers,
+                        active_queries=active_queries,
+                        record=record,
+                        decision="rejected",
+                        result_status="rejected",
+                    )
+                    self._json_response(
+                        200,
+                        {
+                            "ok": True,
+                            "bridgeId": bridge_id,
+                            "approval": _public_mcp_approval_record(record),
+                        },
+                    )
+                    return
+
+                record["updated_at"] = now_txt
+                record["decision"] = "approved"
+                proposed = record.get("proposed_action") if isinstance(record.get("proposed_action"), dict) else {}
+                try:
+                    execution_result = execute_approved_mcp_action(record, pairing_state)
+                    record["status"] = "executed"
+                    record["reason"] = "executed"
+                    record["execution_result"] = execution_result
+                    audit_mcp_approval_decision(pairing_state, record, decision="approved_executed", reason="executed")
+                    post_mcp_approval_decision_governance_event(
+                        query_endpoint=query_endpoint,
+                        default_headers=default_auth_headers,
+                        active_queries=active_queries,
+                        record=record,
+                        decision="approved",
+                        result_status="executed",
+                        execution_result=execution_result,
+                    )
+                    self._json_response(
+                        200,
+                        {
+                            "ok": True,
+                            "bridgeId": bridge_id,
+                            "approval": _public_mcp_approval_record(record),
+                            "executed": True,
+                            "result": execution_result,
+                        },
+                    )
+                    return
+                    record["status"] = "approved_not_executed"
+                    record["reason"] = "executor_not_configured_for_tool"
+                    audit_mcp_approval_decision(pairing_state, record, decision="approved_not_executed", reason=record["reason"])
+                    post_mcp_approval_decision_governance_event(
+                        query_endpoint=query_endpoint,
+                        default_headers=default_auth_headers,
+                        active_queries=active_queries,
+                        record=record,
+                        decision="approved",
+                        result_status="approved_not_executed",
+                    )
+                except BridgeError as e:
+                    record["status"] = "approved_execution_failed"
+                    record["reason"] = str(e)
+                    audit_mcp_approval_decision(pairing_state, record, decision="approved_execution_failed", reason=record["reason"])
+                    post_mcp_approval_decision_governance_event(
+                        query_endpoint=query_endpoint,
+                        default_headers=default_auth_headers,
+                        active_queries=active_queries,
+                        record=record,
+                        decision="approved",
+                        result_status="approved_execution_failed",
+                        execution_result={"error": str(e)},
+                    )
+                    self._json_response(
+                        200,
+                        {
+                            "ok": True,
+                            "bridgeId": bridge_id,
+                            "approval": _public_mcp_approval_record(record),
+                            "executed": False,
+                            "error": "execution_failed",
+                            "reason": str(e),
+                        },
+                    )
+                    return
+                self._json_response(
+                    200,
+                    {
+                        "ok": True,
+                        "bridgeId": bridge_id,
+                        "approval": _public_mcp_approval_record(record),
+                        "executed": False,
+                        "reason": record["reason"],
+                    },
+                )
+                return
+
             register_started = time.perf_counter()
             team_name = str(payload.get("teamName", "")).strip()
             query_id = str(payload.get("queryID", "")).strip()
@@ -1039,6 +1372,7 @@ def make_registration_handler(
 
             key = (team_name, query_id)
             with lock:
+                register_now = time.time()
                 q = active_queries.get(key)
                 if q is None:
                     active_queries[key] = ActiveQuery(
@@ -1046,12 +1380,14 @@ def make_registration_handler(
                         query_id=query_id,
                         user_id=user_id,
                         dialog_index=-1,
-                        last_seen_ts=time.time(),
+                        registered_ts=register_now,
+                        last_seen_ts=register_now,
                         auth_headers=merged_headers,
                         show_partial_results=show_partial_results,
                     )
                 else:
-                    q.last_seen_ts = time.time()
+                    q.registered_ts = register_now
+                    q.last_seen_ts = register_now
                     q.poll_errors = 0
                     q.auth_headers = merged_headers
                     if user_id:
@@ -1093,6 +1429,7 @@ def start_registration_server(
     active_queries: Dict[Tuple[str, str], ActiveQuery],
     lock: threading.Lock,
     default_auth_headers: Dict[str, str],
+    query_endpoint: str,
     pairing_state: Dict[str, object],
     roots: List[Path],
     selected_services: List[str],
@@ -1107,6 +1444,7 @@ def start_registration_server(
         active_queries,
         lock,
         default_auth_headers,
+        query_endpoint,
         pairing_state,
         roots,
         selected_services,
@@ -1130,8 +1468,12 @@ def http_post_json(url: str, payload: Dict[str, object], headers: Dict[str, str]
             raw = resp.read().decode("utf-8", errors="replace")
     except HTTPError as e:
         raise BridgeError(f"HTTP {e.code} from {url}: {e.reason}") from e
+    except RemoteDisconnected as e:
+        raise BridgeError(f"Remote disconnected calling {url}: {e}") from e
     except URLError as e:
         raise BridgeError(f"Network error calling {url}: {e}") from e
+    except TimeoutError as e:
+        raise BridgeError(f"Timeout calling {url}: {e}") from e
 
     try:
         return json.loads(raw)
@@ -4171,6 +4513,1629 @@ def cancel_openclaw_tasks_for_query(
     }
 
 
+def _mcp_audit_events(pairing_state: Dict[str, object]) -> List[Dict[str, object]]:
+    events = pairing_state.get("mcp_audit_events")
+    if isinstance(events, list):
+        return events
+    events = []
+    pairing_state["mcp_audit_events"] = events
+    return events
+
+
+def _mcp_pending_approvals(pairing_state: Dict[str, object]) -> Dict[str, Dict[str, object]]:
+    approvals = pairing_state.get("mcp_pending_approvals")
+    if isinstance(approvals, dict):
+        return approvals
+    approvals = {}
+    pairing_state["mcp_pending_approvals"] = approvals
+    return approvals
+
+
+def _public_mcp_approval_record(record: Dict[str, object]) -> Dict[str, object]:
+    proposed = record.get("proposed_action") if isinstance(record.get("proposed_action"), dict) else {}
+    args = proposed.get("args") if isinstance(proposed.get("args"), dict) else {}
+    return {
+        "approvalID": str(record.get("approval_id") or ""),
+        "status": str(record.get("status") or ""),
+        "createdAt": str(record.get("created_at") or ""),
+        "updatedAt": str(record.get("updated_at") or ""),
+        "provider": str(proposed.get("provider") or ""),
+        "tool": str(proposed.get("tool") or ""),
+        "fullTool": str(record.get("full_tool") or ""),
+        "bridgeId": str(record.get("bridge_id") or ""),
+        "requestID": str(record.get("request_id") or ""),
+        "workroomID": str(record.get("workroom_id") or ""),
+        "userID": str(record.get("user_id") or ""),
+        "agentID": str(record.get("agent_id") or ""),
+        "textPreview": str(args.get("text") or "")[:500],
+        "channelPreview": str(args.get("channel") or args.get("channel_id") or args.get("channelID") or "")[:200],
+        "policy": record.get("policy") if isinstance(record.get("policy"), dict) else {},
+        "decision": str(record.get("decision") or ""),
+        "reason": str(record.get("reason") or ""),
+    }
+
+
+def _record_mcp_approval_required(
+    pairing_state: Dict[str, object],
+    envelope: Dict[str, object],
+    policy: Dict[str, object],
+) -> Dict[str, object]:
+    approvals = _mcp_pending_approvals(pairing_state)
+    approval_id = f"mcp_appr_{int(time.time() * 1000)}_{secrets.token_hex(4)}"
+    provider = str(envelope.get("provider") or "").strip()
+    provider_tool = str(envelope.get("tool") or "").strip()
+    now_txt = datetime.now(timezone.utc).isoformat()
+    record = {
+        "approval_id": approval_id,
+        "status": "pending",
+        "created_at": now_txt,
+        "updated_at": now_txt,
+        "bridge_id": str(envelope.get("bridge_id") or ""),
+        "request_id": str(envelope.get("request_id") or ""),
+        "session_id": str(envelope.get("session_id") or ""),
+        "user_id": str(envelope.get("user_id") or ""),
+        "workroom_id": str(envelope.get("workroom_id") or ""),
+        "agent_id": str(envelope.get("agent_id") or ""),
+        "workflow_id": str(envelope.get("workflow_id") or ""),
+        "full_tool": str(envelope.get("full_tool") or ""),
+        "proposed_action": {
+            "provider": provider,
+            "tool": provider_tool,
+            "args": envelope.get("args") if isinstance(envelope.get("args"), dict) else {},
+        },
+        "policy": dict(policy),
+        "decision": "approval_required",
+        "reason": str(policy.get("reason") or "human_approval_required"),
+    }
+    approvals[approval_id] = record
+    if len(approvals) > 200:
+        for key in sorted(approvals.keys())[:-200]:
+            approvals.pop(key, None)
+    return record
+
+
+def attach_mcp_approval_governance_context(
+    pairing_state: Dict[str, object],
+    approval_id: str,
+    *,
+    team_name: str = "",
+    query_id: str = "",
+    user_id: str = "",
+    auth_headers: Optional[Dict[str, str]] = None,
+) -> None:
+    approval_id = str(approval_id or "").strip()
+    if not approval_id:
+        return
+    approvals = _mcp_pending_approvals(pairing_state)
+    record = approvals.get(approval_id)
+    if not isinstance(record, dict):
+        return
+    if team_name:
+        record["governance_team_name"] = str(team_name)
+    if query_id:
+        record["governance_query_id"] = str(query_id)
+    if user_id:
+        record["governance_user_id"] = str(user_id)
+    if has_auth_credential(auth_headers):
+        record["governance_auth_headers"] = dict(auth_headers or {})
+
+
+def audit_mcp_approval_decision(
+    pairing_state: Dict[str, object],
+    record: Dict[str, object],
+    *,
+    decision: str,
+    reason: str = "",
+) -> None:
+    try:
+        events = _mcp_audit_events(pairing_state)
+        proposed = record.get("proposed_action") if isinstance(record.get("proposed_action"), dict) else {}
+        events.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "request_id": str(record.get("request_id") or ""),
+            "session_id": str(record.get("session_id") or ""),
+            "user_id": str(record.get("user_id") or ""),
+            "workroom_id": str(record.get("workroom_id") or ""),
+            "agent_id": str(record.get("agent_id") or ""),
+            "workflow_id": str(record.get("workflow_id") or ""),
+            "bridge_id": str(record.get("bridge_id") or ""),
+            "service_family": MCP_PREVIEW_SERVICE,
+            "provider": str(proposed.get("provider") or ""),
+            "tool": str(proposed.get("tool") or ""),
+            "full_tool": str(record.get("full_tool") or ""),
+            "approval_id": str(record.get("approval_id") or ""),
+            "approval_decision": str(decision or ""),
+            "policy_decision": "approval_required",
+            "policy_reason": str((record.get("policy") or {}).get("reason") or ""),
+            "result_status": str(reason or decision or ""),
+        })
+        if len(events) > 250:
+            del events[:-250]
+    except Exception:
+        pass
+
+
+def _execute_approved_slack_message(record: Dict[str, object], pairing_state: Dict[str, object]) -> Dict[str, object]:
+    proposed = record.get("proposed_action") if isinstance(record.get("proposed_action"), dict) else {}
+    args = proposed.get("args") if isinstance(proposed.get("args"), dict) else {}
+    token = str((pairing_state.get("slack_config") or {}).get("token") or "").strip()
+    default_channel = str((pairing_state.get("slack_config") or {}).get("default_channel") or "").strip()
+    channel = str(args.get("channel") or args.get("channel_id") or args.get("channelID") or default_channel).strip()
+    text = str(args.get("text") or "").strip()
+    if not token:
+        raise BridgeError("slack_token_not_configured")
+    if not channel:
+        raise BridgeError("slack_channel_not_configured")
+    if not text:
+        raise BridgeError("slack_message_text_required")
+
+    payload = {
+        "channel": channel,
+        "text": text,
+    }
+    req = Request(
+        "https://slack.com/api/chat.postMessage",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:500]
+        raise BridgeError(f"slack_http_{e.code}: {detail}") from e
+    except URLError as e:
+        raise BridgeError(f"slack_network_error: {e}") from e
+    try:
+        obj = json.loads(raw)
+    except Exception as e:
+        raise BridgeError(f"slack_invalid_json: {raw[:300]}") from e
+    if not isinstance(obj, dict) or obj.get("ok") is not True:
+        raise BridgeError(f"slack_api_error: {str((obj or {}).get('error') or raw)[:300]}")
+    return {
+        "provider": "slack",
+        "tool": "messages.post",
+        "channel": str(obj.get("channel") or channel),
+        "ts": str(obj.get("ts") or ""),
+        "message": obj.get("message") if isinstance(obj.get("message"), dict) else {},
+    }
+
+
+def _slack_api_request(method_name: str, token: str, params: Optional[Dict[str, object]] = None, payload: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+    token_txt = str(token or "").strip()
+    if not token_txt:
+        raise BridgeError("slack_token_not_configured")
+    url = f"https://slack.com/api/{method_name}"
+    headers = {"Authorization": f"Bearer {token_txt}"}
+    data = None
+    if payload is not None:
+        data = json.dumps(payload or {}).encode("utf-8")
+        headers["Content-Type"] = "application/json; charset=utf-8"
+    elif params:
+        url = f"{url}?{urlencode({k: v for k, v in (params or {}).items() if v not in (None, '')})}"
+    req = Request(url, data=data, headers=headers, method="POST" if data is not None else "GET")
+    try:
+        with urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:500]
+        raise BridgeError(f"slack_http_{e.code}: {detail}") from e
+    except URLError as e:
+        raise BridgeError(f"slack_network_error: {e}") from e
+    try:
+        obj = json.loads(raw)
+    except Exception as e:
+        raise BridgeError(f"slack_invalid_json: {raw[:300]}") from e
+    if not isinstance(obj, dict) or obj.get("ok") is not True:
+        raise BridgeError(f"slack_api_error: {str((obj or {}).get('error') or raw)[:300]}")
+    return obj
+
+
+def _resolve_slack_channel_id(channel: str, pairing_state: Dict[str, object]) -> Tuple[str, str]:
+    token = str((pairing_state.get("slack_config") or {}).get("token") or "").strip()
+    channel_txt = str(channel or "").strip()
+    if not token:
+        raise BridgeError("slack_token_not_configured")
+    if not channel_txt:
+        channel_txt = str((pairing_state.get("slack_config") or {}).get("default_channel") or "").strip()
+    if not channel_txt:
+        raise BridgeError("slack_channel_not_configured")
+    if re.match(r"^[CGD][A-Z0-9]+$", channel_txt):
+        return channel_txt, channel_txt
+    wanted = channel_txt[1:] if channel_txt.startswith("#") else channel_txt
+    cursor = ""
+    for _ in range(20):
+        params = {
+            "types": "public_channel,private_channel",
+            "exclude_archived": "true",
+            "limit": "200",
+        }
+        if cursor:
+            params["cursor"] = cursor
+        obj = _slack_api_request("conversations.list", token, params=params)
+        for ch in obj.get("channels") or []:
+            if not isinstance(ch, dict):
+                continue
+            name = str(ch.get("name") or "").strip()
+            cid = str(ch.get("id") or "").strip()
+            if cid and name.lower() == wanted.lower():
+                return cid, f"#{name}"
+        cursor = str(((obj.get("response_metadata") or {}).get("next_cursor")) or "").strip()
+        if not cursor:
+            break
+    raise BridgeError(f"slack_channel_not_found: {channel_txt}")
+
+
+def _slack_user_name(user_id: str, token: str, cache: Dict[str, str]) -> str:
+    uid = str(user_id or "").strip()
+    if not uid:
+        return ""
+    if uid in cache:
+        return cache[uid]
+    if uid.startswith("B"):
+        cache[uid] = "Slack bot"
+        return cache[uid]
+    try:
+        obj = _slack_api_request("users.info", token, params={"user": uid})
+        user = obj.get("user") if isinstance(obj.get("user"), dict) else {}
+        profile = user.get("profile") if isinstance(user.get("profile"), dict) else {}
+        name = (
+            str(profile.get("real_name") or "").strip()
+            or str(user.get("real_name") or "").strip()
+            or str(profile.get("display_name") or "").strip()
+            or str(user.get("name") or "").strip()
+            or uid
+        )
+        cache[uid] = name
+    except Exception:
+        cache[uid] = uid
+    return cache[uid]
+
+
+def _slack_ts_to_local_time(ts: str) -> str:
+    try:
+        seconds = float(str(ts or "0").strip() or "0")
+        if seconds <= 0:
+            return ""
+        dt = datetime.fromtimestamp(seconds).astimezone()
+        hour = dt.hour % 12 or 12
+        return f"{hour}:{dt.minute:02d} {dt.strftime('%p')}"
+    except Exception:
+        return ""
+
+
+def _clean_slack_text(text: str, channel_names: Optional[Dict[str, str]] = None, user_names: Optional[Dict[str, str]] = None) -> str:
+    out = str(text or "")
+    channels = channel_names if isinstance(channel_names, dict) else {}
+    users = user_names if isinstance(user_names, dict) else {}
+
+    def replace_channel(match):
+        cid = str(match.group(1) or "").strip()
+        label = str(match.group(2) or "").strip()
+        if label:
+            return f"#{label}"
+        return channels.get(cid, f"#{cid}")
+
+    def replace_user(match):
+        uid = str(match.group(1) or "").strip()
+        return f"@{users.get(uid, uid)}"
+
+    out = re.sub(r"<#([A-Z0-9]+)(?:\|([^>]+))?>", replace_channel, out)
+    out = re.sub(r"<@([A-Z0-9]+)>", replace_user, out)
+    out = re.sub(r"<(https?://[^>|]+)(?:\|([^>]+))?>", lambda m: str(m.group(2) or m.group(1)), out)
+    return html.unescape(out).strip()
+
+
+def _normalize_slack_history_args(args: Dict[str, object]) -> Dict[str, object]:
+    raw = dict(args or {})
+    text = str(raw.get("text") or raw.get("query") or "").strip()
+    channel = str(raw.get("channel") or raw.get("channel_id") or raw.get("channelID") or "").strip()
+    if not channel and text:
+        match = re.search(r"(?<!\w)#([A-Za-z0-9][A-Za-z0-9_-]{0,78})\b", text)
+        if match:
+            channel = f"#{match.group(1)}"
+    try:
+        limit = int(raw.get("limit") or 10)
+    except Exception:
+        limit = 10
+    limit = max(1, min(limit, 50))
+    normalized = dict(raw)
+    if channel:
+        normalized["channel"] = channel
+    normalized["limit"] = limit
+    return normalized
+
+
+def execute_slack_channel_history(call: BridgeCall, pairing_state: Dict[str, object]) -> Dict[str, object]:
+    token = str((pairing_state.get("slack_config") or {}).get("token") or "").strip()
+    args = _normalize_slack_history_args(call.args if isinstance(call.args, dict) else {})
+    channel_id, channel_label = _resolve_slack_channel_id(str(args.get("channel") or ""), pairing_state)
+    limit = int(args.get("limit") or 10)
+    obj = _slack_api_request("conversations.history", token, params={
+        "channel": channel_id,
+        "limit": str(limit),
+        "inclusive": "true",
+    })
+    messages = []
+    user_cache: Dict[str, str] = {}
+    channel_cache = {channel_id: channel_label}
+    for msg in obj.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        subtype = str(msg.get("subtype") or "").strip()
+        if subtype and subtype not in {"bot_message"}:
+            continue
+        user_id = str(msg.get("user") or msg.get("bot_id") or "").strip()
+        messages.append({
+            "ts": str(msg.get("ts") or ""),
+            "time": _slack_ts_to_local_time(str(msg.get("ts") or "")),
+            "user": user_id,
+            "user_name": _slack_user_name(user_id, token, user_cache),
+            "text": _clean_slack_text(str(msg.get("text") or "").strip(), channel_cache, user_cache),
+            "subtype": subtype,
+        })
+    return {
+        "provider": "slack",
+        "tool": "channels.history",
+        "status": "completed",
+        "service_family": MCP_PREVIEW_SERVICE,
+        "phase": "phase_2_read_only",
+        "channel": channel_label,
+        "channel_id": channel_id,
+        "limit": limit,
+        "messages": messages,
+        "has_more": bool(obj.get("has_more")),
+    }
+
+
+def _github_config(pairing_state: Dict[str, object]) -> Dict[str, str]:
+    cfg = pairing_state.get("github_config") if isinstance(pairing_state.get("github_config"), dict) else {}
+    return {
+        "token": str(cfg.get("token") or "").strip(),
+        "default_repo": str(cfg.get("default_repo") or "").strip(),
+    }
+
+
+def _github_api_request(
+    method: str,
+    path: str,
+    token: str,
+    params: Optional[Dict[str, object]] = None,
+    payload: Optional[Dict[str, object]] = None,
+) -> object:
+    token_txt = str(token or "").strip()
+    if not token_txt:
+        raise BridgeError("github_token_not_configured")
+    path_txt = str(path or "").strip()
+    if not path_txt.startswith("/"):
+        path_txt = f"/{path_txt}"
+    url = f"https://api.github.com{path_txt}"
+    if params:
+        query = urlencode({k: v for k, v in (params or {}).items() if v not in (None, "")})
+        if query:
+            url = f"{url}?{query}"
+    headers = {
+        "Authorization": f"Bearer {token_txt}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    data = None
+    if payload is not None:
+        data = json.dumps(payload or {}).encode("utf-8")
+        headers["Content-Type"] = "application/json; charset=utf-8"
+    req = Request(url, data=data, headers=headers, method=str(method or "GET").upper())
+    try:
+        with urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:500]
+        raise BridgeError(f"github_http_{e.code}: {detail}") from e
+    except URLError as e:
+        raise BridgeError(f"github_network_error: {e}") from e
+    if not raw.strip():
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        raise BridgeError(f"github_invalid_json: {raw[:300]}") from e
+
+
+def _resolve_github_repo(args: Dict[str, object], pairing_state: Dict[str, object]) -> Tuple[str, str, str]:
+    cfg = _github_config(pairing_state)
+    repo = str(
+        args.get("repo")
+        or args.get("repository")
+        or args.get("repository_full_name")
+        or args.get("repositoryFullName")
+        or cfg.get("default_repo")
+        or ""
+    ).strip()
+    owner = str(args.get("owner") or args.get("org") or args.get("organization") or "").strip()
+    name = str(args.get("name") or args.get("repo_name") or args.get("repoName") or "").strip()
+    if repo and "/" in repo:
+        left, right = repo.split("/", 1)
+        owner = owner or left.strip()
+        name = name or right.strip()
+    if not owner or not name:
+        raise BridgeError("github_repo_required")
+    return owner, name, f"{owner}/{name}"
+
+
+def normalize_github_args(provider_tool: str, args: Dict[str, object]) -> Dict[str, object]:
+    raw = dict(args or {})
+    if provider_tool == "issues.create":
+        title = str(raw.get("title") or raw.get("summary") or "").strip()
+        body = str(raw.get("body") or raw.get("text") or raw.get("description") or "").strip()
+        if not title and body:
+            title = body.splitlines()[0][:120].strip()
+        normalized = dict(raw)
+        normalized["title"] = title[:256]
+        if body:
+            normalized["body"] = body[:8000]
+        return normalized
+    if provider_tool == "issues.list":
+        normalized = dict(raw)
+        state = str(raw.get("state") or "open").strip().lower()
+        normalized["state"] = state if state in {"open", "closed", "all"} else "open"
+        try:
+            normalized["limit"] = max(1, min(int(raw.get("limit") or 10), 50))
+        except Exception:
+            normalized["limit"] = 10
+        return normalized
+    return raw
+
+
+def execute_github_repository_get(call: BridgeCall, pairing_state: Dict[str, object]) -> Dict[str, object]:
+    cfg = _github_config(pairing_state)
+    args = call.args if isinstance(call.args, dict) else {}
+    owner, name, full_name = _resolve_github_repo(args, pairing_state)
+    obj = _github_api_request("GET", f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}", cfg["token"])
+    if not isinstance(obj, dict):
+        raise BridgeError("github_unexpected_repository_response")
+    return {
+        "provider": "github",
+        "tool": "repositories.get",
+        "status": "completed",
+        "service_family": MCP_PREVIEW_SERVICE,
+        "phase": "phase_4_read_only",
+        "repo": full_name,
+        "description": str(obj.get("description") or ""),
+        "default_branch": str(obj.get("default_branch") or ""),
+        "private": bool(obj.get("private")),
+        "html_url": str(obj.get("html_url") or ""),
+        "open_issues_count": int(obj.get("open_issues_count") or 0),
+    }
+
+
+def execute_github_issues_list(call: BridgeCall, pairing_state: Dict[str, object]) -> Dict[str, object]:
+    cfg = _github_config(pairing_state)
+    args = normalize_github_args("issues.list", call.args if isinstance(call.args, dict) else {})
+    owner, name, full_name = _resolve_github_repo(args, pairing_state)
+    limit = int(args.get("limit") or 10)
+    obj = _github_api_request("GET", f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}/issues", cfg["token"], params={
+        "state": str(args.get("state") or "open"),
+        "per_page": str(limit),
+        "sort": "created",
+        "direction": "desc",
+    })
+    if not isinstance(obj, list):
+        raise BridgeError("github_unexpected_issues_response")
+    issues = []
+    for item in obj[:limit]:
+        if not isinstance(item, dict) or item.get("pull_request"):
+            continue
+        issues.append({
+            "number": item.get("number"),
+            "title": str(item.get("title") or ""),
+            "state": str(item.get("state") or ""),
+            "html_url": str(item.get("html_url") or ""),
+            "created_at": str(item.get("created_at") or ""),
+            "user": str((item.get("user") or {}).get("login") or "") if isinstance(item.get("user"), dict) else "",
+        })
+    return {
+        "provider": "github",
+        "tool": "issues.list",
+        "status": "completed",
+        "service_family": MCP_PREVIEW_SERVICE,
+        "phase": "phase_4_read_only",
+        "repo": full_name,
+        "state": str(args.get("state") or "open"),
+        "issues": issues,
+    }
+
+
+def _execute_approved_github_issue_create(record: Dict[str, object], pairing_state: Dict[str, object]) -> Dict[str, object]:
+    cfg = _github_config(pairing_state)
+    proposed = record.get("proposed_action") if isinstance(record.get("proposed_action"), dict) else {}
+    args = normalize_github_args("issues.create", proposed.get("args") if isinstance(proposed.get("args"), dict) else {})
+    owner, name, full_name = _resolve_github_repo(args, pairing_state)
+    title = str(args.get("title") or "").strip()
+    body = str(args.get("body") or "").strip()
+    if not title:
+        raise BridgeError("github_issue_title_required")
+    payload = {"title": title}
+    if body:
+        payload["body"] = body
+    obj = _github_api_request("POST", f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}/issues", cfg["token"], payload=payload)
+    if not isinstance(obj, dict) or not obj.get("number"):
+        raise BridgeError("github_unexpected_issue_create_response")
+    return {
+        "provider": "github",
+        "tool": "issues.create",
+        "repo": full_name,
+        "number": obj.get("number"),
+        "title": str(obj.get("title") or title),
+        "html_url": str(obj.get("html_url") or ""),
+        "state": str(obj.get("state") or ""),
+    }
+
+
+def execute_approved_mcp_action(record: Dict[str, object], pairing_state: Dict[str, object]) -> Dict[str, object]:
+    proposed = record.get("proposed_action") if isinstance(record.get("proposed_action"), dict) else {}
+    provider = str(proposed.get("provider") or "").strip().lower()
+    tool = str(proposed.get("tool") or "").strip().lower()
+    if provider == "slack" and tool == "messages.post":
+        return _execute_approved_slack_message(record, pairing_state)
+    if provider == "github" and tool == "issues.create":
+        return _execute_approved_github_issue_create(record, pairing_state)
+    if provider == "zapier" and tool in {"actions.run", "actions.execute_write"}:
+        return _execute_approved_zapier_action_run(record, pairing_state)
+    raise BridgeError("executor_not_configured_for_tool")
+
+
+def _zapier_config(pairing_state: Dict[str, object]) -> Dict[str, str]:
+    cfg = pairing_state.get("zapier_config") if isinstance(pairing_state.get("zapier_config"), dict) else {}
+    return {
+        "server_url": str(cfg.get("server_url") or "").strip(),
+        "token": str(cfg.get("token") or "").strip(),
+    }
+
+
+def _parse_mcp_http_response(raw: str) -> Dict[str, object]:
+    txt = str(raw or "").strip()
+    if not txt:
+        return {}
+    try:
+        obj = json.loads(txt)
+        return obj if isinstance(obj, dict) else {"result": obj}
+    except Exception:
+        pass
+    data_lines = []
+    for line in txt.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("data:"):
+            data = stripped[5:].strip()
+            if data and data != "[DONE]":
+                data_lines.append(data)
+    for data in reversed(data_lines):
+        try:
+            obj = json.loads(data)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            continue
+    raise BridgeError(f"mcp_invalid_response: {txt[:300]}")
+
+
+def _zapier_mcp_http_request(
+    pairing_state: Dict[str, object],
+    payload: Dict[str, object],
+    *,
+    session_id: str = "",
+    timeout: int = 45,
+) -> Tuple[Dict[str, object], str]:
+    cfg = _zapier_config(pairing_state)
+    url = cfg.get("server_url") or ""
+    if not url:
+        record_zapier_debug_event(pairing_state, "missing_server_url")
+        raise BridgeError("zapier_mcp_server_url_not_configured")
+    headers = {
+        "Accept": "text/event-stream, application/json",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    token = cfg.get("token") or ""
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+    req = Request(
+        url,
+        data=json.dumps(payload or {}).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    method_name = str((payload or {}).get("method") or "").strip()
+    request_id = str((payload or {}).get("id") or "").strip()
+    record_zapier_debug_event(pairing_state, "http_start", {
+        "method": method_name,
+        "id": request_id,
+        "hasSession": bool(session_id),
+        "timeout": timeout,
+        "url": url,
+        "tokenConfigured": bool(token),
+    })
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            new_session_id = str(resp.headers.get("Mcp-Session-Id") or resp.headers.get("mcp-session-id") or session_id or "").strip()
+            content_type = str(resp.headers.get("Content-Type") or resp.headers.get("content-type") or "").lower()
+            record_zapier_debug_event(pairing_state, "http_response_headers", {
+                "method": method_name,
+                "id": request_id,
+                "contentType": content_type,
+                "hasSession": bool(new_session_id),
+            })
+            if "text/event-stream" in content_type:
+                data_lines: List[str] = []
+                line_count = 0
+                while True:
+                    line_count += 1
+                    if line_count > 1000:
+                        raise BridgeError("zapier_mcp_stream_line_limit_exceeded")
+                    line = resp.readline()
+                    if not line:
+                        break
+                    txt = line.decode("utf-8", errors="replace").strip()
+                    if not txt:
+                        if data_lines:
+                            data = "\n".join(data_lines).strip()
+                            data_lines = []
+                            if data and data != "[DONE]":
+                                try:
+                                    obj = json.loads(data)
+                                    if isinstance(obj, dict) and (
+                                        obj.get("id") is not None
+                                        or "result" in obj
+                                        or "error" in obj
+                                    ):
+                                        record_zapier_debug_event(pairing_state, "stream_result", {
+                                            "method": method_name,
+                                            "id": request_id,
+                                            "resultKeys": sorted(list((obj.get("result") if isinstance(obj.get("result"), dict) else {}).keys())),
+                                            "hasError": bool(obj.get("error")),
+                                            "lineCount": line_count,
+                                        })
+                                        return obj, new_session_id
+                                except Exception:
+                                    pass
+                        continue
+                    if txt.startswith("data:"):
+                        data_lines.append(txt[5:].strip())
+                if data_lines:
+                    data = "\n".join(data_lines).strip()
+                    if data and data != "[DONE]":
+                        obj = json.loads(data)
+                        if isinstance(obj, dict):
+                            record_zapier_debug_event(pairing_state, "stream_result_at_close", {
+                                "method": method_name,
+                                "id": request_id,
+                                "hasError": bool(obj.get("error")),
+                            })
+                            return obj, new_session_id
+                raise BridgeError("zapier_mcp_stream_closed_without_result")
+            raw = resp.read().decode("utf-8", errors="replace")
+            record_zapier_debug_event(pairing_state, "http_body", {
+                "method": method_name,
+                "id": request_id,
+                "bytes": len(raw),
+            })
+    except HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:500]
+        record_zapier_debug_event(pairing_state, "http_error", {"method": method_name, "id": request_id, "status": e.code, "detail": detail[:220]})
+        raise BridgeError(f"zapier_mcp_http_{e.code}: {detail}") from e
+    except URLError as e:
+        record_zapier_debug_event(pairing_state, "network_error", {"method": method_name, "id": request_id, "error": str(e)[:220]})
+        raise BridgeError(f"zapier_mcp_network_error: {e}") from e
+    except TimeoutError as e:
+        record_zapier_debug_event(pairing_state, "timeout", {"method": method_name, "id": request_id, "timeout": timeout})
+        raise BridgeError(f"zapier_mcp_timeout: {timeout}s") from e
+    return _parse_mcp_http_response(raw), new_session_id
+
+
+def _bridge_call_timeout_seconds(call: BridgeCall, default_seconds: int = 60) -> int:
+    try:
+        raw_timeout = (call.raw or {}).get("timeout_ms")
+        if raw_timeout is None:
+            raw_timeout = (call.args or {}).get("timeout_ms")
+        timeout_ms = int(raw_timeout) if raw_timeout is not None else int(default_seconds * 1000)
+        return max(5, min(120, int((timeout_ms + 999) // 1000)))
+    except Exception:
+        return int(default_seconds)
+
+
+def _zapier_mcp_session_call(
+    pairing_state: Dict[str, object],
+    method: str,
+    params: Optional[Dict[str, object]] = None,
+    *,
+    call_timeout: int = 60,
+) -> Dict[str, object]:
+    record_zapier_debug_event(pairing_state, "session_start", {"method": method})
+    init_payload = {
+        "jsonrpc": "2.0",
+        "id": f"init_{int(time.time() * 1000)}",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "sentienta-bridge", "version": MCP_PREVIEW_BRIDGE_VERSION},
+        },
+    }
+    init_obj, session_id = _zapier_mcp_http_request(pairing_state, init_payload, timeout=15)
+    if init_obj.get("error"):
+        raise BridgeError(f"zapier_mcp_initialize_error: {json.dumps(init_obj.get('error'), ensure_ascii=False)[:300]}")
+    record_zapier_debug_event(pairing_state, "initialized", {"method": method, "hasSession": bool(session_id)})
+    try:
+        _zapier_mcp_http_request(pairing_state, {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        }, session_id=session_id, timeout=2)
+    except Exception:
+        record_zapier_debug_event(pairing_state, "initialized_notification_ignored", {"method": method})
+        pass
+    call_obj, _ = _zapier_mcp_http_request(pairing_state, {
+        "jsonrpc": "2.0",
+        "id": f"call_{int(time.time() * 1000)}",
+        "method": method,
+        "params": params or {},
+    }, session_id=session_id, timeout=max(5, min(int(call_timeout or 60), 120)))
+    if call_obj.get("error"):
+        raise BridgeError(f"zapier_mcp_error: {json.dumps(call_obj.get('error'), ensure_ascii=False)[:500]}")
+    result = call_obj.get("result")
+    return result if isinstance(result, dict) else {"result": result}
+
+
+def execute_zapier_tools_list(call: BridgeCall, pairing_state: Dict[str, object]) -> Dict[str, object]:
+    result = _zapier_mcp_session_call(pairing_state, "tools/list", {}, call_timeout=max(45, _bridge_call_timeout_seconds(call, 45)))
+    tools = result.get("tools") if isinstance(result.get("tools"), list) else []
+    normalized_tools = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        normalized_tools.append({
+            "name": str(tool.get("name") or "").strip(),
+            "description": str(tool.get("description") or "").strip(),
+            "inputSchema": tool.get("inputSchema") if isinstance(tool.get("inputSchema"), dict) else {},
+        })
+    return {
+        "provider": "zapier",
+        "tool": "tools.list",
+        "status": "completed",
+        "service_family": MCP_PREVIEW_SERVICE,
+        "phase": "phase_5_read_only",
+        "tools": normalized_tools,
+    }
+
+
+def execute_zapier_tool_call(
+    call: BridgeCall,
+    pairing_state: Dict[str, object],
+    provider_tool: str,
+    zapier_tool_name: str,
+    arguments: Optional[Dict[str, object]] = None,
+    phase: str = "phase_5_read_only",
+) -> Dict[str, object]:
+    tool_args = arguments if isinstance(arguments, dict) else {}
+    result = _zapier_mcp_session_call(pairing_state, "tools/call", {
+        "name": zapier_tool_name,
+        "arguments": tool_args,
+    }, call_timeout=max(60, _bridge_call_timeout_seconds(call, 60)))
+    return {
+        "provider": "zapier",
+        "tool": provider_tool,
+        "zapier_tool": zapier_tool_name,
+        "status": "completed",
+        "service_family": MCP_PREVIEW_SERVICE,
+        "phase": phase,
+        "arguments": tool_args,
+        "result": result,
+    }
+
+
+def _zapier_extract_text_payload(result: Dict[str, object]) -> str:
+    content = result.get("content") if isinstance(result.get("content"), list) else []
+    chunks: List[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if str(part.get("type") or "").strip().lower() == "text":
+            txt = str(part.get("text") or "").strip()
+            if txt:
+                chunks.append(txt)
+    return "\n".join(chunks).strip()
+
+
+def _zapier_parse_payload(result: Dict[str, object]) -> object:
+    if isinstance(result.get("structuredContent"), dict):
+        return result.get("structuredContent")
+    txt = _zapier_extract_text_payload(result)
+    if not txt:
+        return None
+    try:
+        return json.loads(txt)
+    except Exception:
+        match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", txt)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except Exception:
+                return None
+    return None
+
+
+def _zapier_action_display_name(item: Dict[str, object], fallback: str = "") -> str:
+    ignored_keys = {
+        "hint", "message", "instructions", "instruction", "selected_api", "selectedApi",
+        "api", "apps", "schema", "inputSchema", "parameters", "params",
+        "code_action_hint", "codeActionHint", "dynamic_properties_depends_on",
+    }
+    for key in (
+        "tool_name", "toolName", "name", "action", "operation", "operation_id",
+        "operationId", "id", "label", "title", "display_name", "displayName", "key",
+    ):
+        if key in ignored_keys:
+            continue
+        value = str(item.get(key) or "").strip()
+        if value and value.lower() not in {"zapier action", "action"}:
+            return value
+    return str(fallback or "").strip()
+
+
+def _zapier_normalize_action_item(item: object, fallback_name: str = "") -> Optional[Dict[str, object]]:
+    if isinstance(item, str):
+        txt = item.strip()
+        return {"name": txt, "label": txt} if txt else None
+    if not isinstance(item, dict):
+        return None
+    raw = dict(item)
+    if len(raw) == 1:
+        only_key = next(iter(raw.keys()))
+        only_value = raw.get(only_key)
+        if isinstance(only_value, dict):
+            nested = _zapier_normalize_action_item(only_value, str(only_key))
+            if nested:
+                return nested
+        if isinstance(only_value, str) and not _zapier_action_display_name(raw):
+            return {"name": str(only_key).strip(), "label": str(only_value).strip()}
+    name = _zapier_action_display_name(raw, fallback_name)
+    if not name:
+        for key, value in raw.items():
+            if key in {"selected_api", "selectedApi", "api", "app", "app_id", "appId", "hint", "message", "instructions", "instruction", "code_action_hint", "codeActionHint", "dynamic_properties_depends_on"}:
+                continue
+            if isinstance(value, str) and value.strip():
+                name = value.strip()
+                break
+    label = str(raw.get("label") or raw.get("title") or raw.get("display_name") or raw.get("displayName") or "").strip()
+    if not label and str(raw.get("name") or "").strip() and str(raw.get("name") or "").strip() != name:
+        label = str(raw.get("name") or "").strip()
+    description = str(raw.get("description") or raw.get("summary") or raw.get("help_text") or raw.get("helpText") or "").strip()
+    normalized = {
+        "name": name or "Zapier (beta) action",
+        "label": label,
+        "description": description,
+    }
+    for key in ("app", "app_name", "service", "provider"):
+        if raw.get(key):
+            normalized[key] = raw.get(key)
+    return normalized
+
+
+def _zapier_collect_action_rows(value: object) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                nested = _zapier_collect_action_rows(item)
+                if nested:
+                    rows.extend(nested)
+                    continue
+            normalized = _zapier_normalize_action_item(item)
+            if normalized:
+                rows.append(normalized)
+        return rows
+    if not isinstance(value, dict):
+        return rows
+    for key in ("actions", "enabled_actions", "enabledActions", "results", "items", "data", "tools"):
+        child = value.get(key)
+        if isinstance(child, list):
+            return _zapier_collect_action_rows(child)
+        if isinstance(child, dict):
+            nested = _zapier_collect_action_rows(child)
+            if nested:
+                return nested
+    action_marker_keys = {
+        "tool_name", "toolName", "name", "action", "operation", "operation_id",
+        "operationId", "id", "label", "title", "display_name", "displayName",
+    }
+    if any(key in value for key in action_marker_keys):
+        normalized = _zapier_normalize_action_item(value)
+        return [normalized] if normalized else []
+    # Zapier (beta) sometimes returns an object keyed by user-facing action names.
+    keyed_rows = []
+    for key, child in value.items():
+        if str(key or "").strip() in {"apps", "hint", "message", "instructions", "instruction", "selected_api", "selectedApi", "code_action_hint", "codeActionHint", "dynamic_properties_depends_on"}:
+            continue
+        if isinstance(child, (dict, str)):
+            normalized = _zapier_normalize_action_item(child, str(key))
+            if normalized:
+                keyed_rows.append(normalized)
+        elif isinstance(child, list):
+            nested = _zapier_collect_action_rows(child)
+            if nested:
+                keyed_rows.extend(nested)
+    return keyed_rows
+
+
+def execute_zapier_enabled_actions_list(call: BridgeCall, pairing_state: Dict[str, object]) -> Dict[str, object]:
+    base_args = normalize_zapier_args("actions.list_enabled", call.args)
+    call_timeout = max(60, _bridge_call_timeout_seconds(call, 60))
+    first = _zapier_mcp_session_call(pairing_state, "tools/call", {
+        "name": "list_enabled_zapier_actions",
+        "arguments": base_args,
+    }, call_timeout=call_timeout)
+    payload = _zapier_parse_payload(first)
+    apps = payload.get("apps") if isinstance(payload, dict) and isinstance(payload.get("apps"), list) else []
+    app_filter = str(base_args.get("app") or "").strip().lower() if isinstance(base_args, dict) else ""
+    resolved_apps: List[Dict[str, object]] = []
+    for app in apps:
+        if not isinstance(app, dict):
+            continue
+        app_name = str(app.get("app") or app.get("name") or "").strip()
+        selected_api = str(app.get("selected_api") or "").strip()
+        if app_filter and app_filter not in app_name.lower():
+            continue
+        app_record: Dict[str, object] = {
+            "app": app_name,
+            "action_count": int(app.get("action_count") or 0) if str(app.get("action_count") or "").isdigit() else app.get("action_count", 0),
+            "actions": [],
+        }
+        if selected_api:
+            try:
+                detail = _zapier_mcp_session_call(pairing_state, "tools/call", {
+                    "name": "list_enabled_zapier_actions",
+                    "arguments": {"selected_api": selected_api},
+                }, call_timeout=call_timeout)
+                app_record["result"] = detail
+                app_record["raw_text"] = _zapier_extract_text_payload(detail)[:2000]
+                detail_payload = _zapier_parse_payload(detail)
+                try:
+                    record_zapier_debug_event(pairing_state, "enabled_actions_app_detail", {
+                        "app": app_name,
+                        "payload_type": type(detail_payload).__name__,
+                        "payload_keys": list(detail_payload.keys())[:20] if isinstance(detail_payload, dict) else [],
+                        "payload_list_len": len(detail_payload) if isinstance(detail_payload, list) else 0,
+                        "raw_text_preview": app_record.get("raw_text", "")[:500],
+                    })
+                except Exception:
+                    pass
+                app_record["actions"] = _zapier_collect_action_rows(detail_payload)
+                try:
+                    record_zapier_debug_event(pairing_state, "enabled_actions_normalized", {
+                        "app": app_name,
+                        "action_count": len(app_record.get("actions") or []),
+                        "sample": (app_record.get("actions") or [])[:5],
+                    })
+                except Exception:
+                    pass
+            except Exception as e:
+                app_record["error"] = str(e)[:220]
+        resolved_apps.append(app_record)
+    return {
+        "provider": "zapier",
+        "tool": "actions.list_enabled",
+        "zapier_tool": "list_enabled_zapier_actions",
+        "status": "completed",
+        "service_family": MCP_PREVIEW_SERVICE,
+        "phase": "phase_5_read_only",
+        "arguments": base_args,
+        "apps": resolved_apps,
+        "result": first,
+    }
+
+
+def normalize_zapier_args(provider_tool: str, args: Dict[str, object]) -> Dict[str, object]:
+    raw = dict(args or {})
+    if provider_tool in {"actions.run", "actions.execute_read", "actions.execute_write"}:
+        tool_name = str(raw.get("name") or raw.get("tool") or raw.get("tool_name") or raw.get("action") or "").strip()
+        tool_args = raw.get("arguments") if isinstance(raw.get("arguments"), dict) else raw.get("args")
+        if not isinstance(tool_args, dict):
+            reserved = {"name", "tool", "tool_name", "action", "arguments", "args", "reason"}
+            tool_args = {k: v for k, v in raw.items() if k not in reserved}
+        normalized = dict(raw)
+        normalized["name"] = tool_name
+        normalized["arguments"] = dict(tool_args or {})
+        return normalized
+    if provider_tool == "actions.discover":
+        query = str(raw.get("query") or raw.get("app") or raw.get("search") or "").strip()
+        return {"query": query} if query else {}
+    if provider_tool == "actions.list_enabled":
+        app = str(raw.get("app") or raw.get("provider") or "").strip()
+        return {"app": app} if app else {}
+    return raw
+
+
+def execute_zapier_action_read(call: BridgeCall, pairing_state: Dict[str, object]) -> Dict[str, object]:
+    args = normalize_zapier_args("actions.execute_read", call.args)
+    tool_name = str(args.get("name") or "").strip()
+    tool_args = args.get("arguments") if isinstance(args.get("arguments"), dict) else {}
+    if not tool_name:
+        raise BridgeError("zapier_tool_name_required")
+    call_timeout = max(60, _bridge_call_timeout_seconds(call, 60))
+    execution = _execute_zapier_enabled_action(
+        pairing_state,
+        tool_name,
+        tool_args,
+        preferred_executor="execute_zapier_read_action",
+        call_timeout=call_timeout,
+    )
+    return {
+        "provider": "zapier",
+        "tool": "actions.execute_read",
+        "zapier_tool": tool_name,
+        "zapier_executor": execution.get("executor"),
+        "status": "completed",
+        "service_family": MCP_PREVIEW_SERVICE,
+        "phase": "phase_5_read_only",
+        "arguments": execution.get("arguments") if isinstance(execution.get("arguments"), dict) else tool_args,
+        "result": execution.get("result") if isinstance(execution.get("result"), dict) else {},
+    }
+
+
+def _zapier_resolve_enabled_action(pairing_state: Dict[str, object], tool_name: str, *, call_timeout: int = 60) -> Dict[str, object]:
+    name = str(tool_name or "").strip()
+    if not name:
+        raise BridgeError("zapier_tool_name_required")
+    detail = _zapier_mcp_session_call(pairing_state, "tools/call", {
+        "name": "list_enabled_zapier_actions",
+        "arguments": {"tool_name": name},
+    }, call_timeout=call_timeout)
+    payload = _zapier_parse_payload(detail)
+    if not isinstance(payload, list):
+        raise BridgeError(f"zapier_action_not_found: {name}")
+    for app in payload:
+        if not isinstance(app, dict):
+            continue
+        selected_api = str(app.get("selected_api") or "").strip()
+        actions = app.get("actions") if isinstance(app.get("actions"), list) else []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            if str(action.get("tool_name") or "").strip() == name:
+                return {
+                    "selected_api": selected_api,
+                    "action": str(action.get("key") or "").strip(),
+                    "name": str(action.get("name") or "").strip(),
+                    "tool_name": name,
+                    "executor": str(action.get("tool") or "").strip(),
+                    "params_schema": action.get("params") if isinstance(action.get("params"), list) else [],
+                    "app": str(app.get("app") or "").strip(),
+                }
+    raise BridgeError(f"zapier_action_not_found: {name}")
+
+
+def _zapier_build_executor_arguments(action_meta: Dict[str, object], user_args: Dict[str, object]) -> Dict[str, object]:
+    args = user_args if isinstance(user_args, dict) else {}
+    selected_api = str(action_meta.get("selected_api") or "").strip()
+    action_key = str(action_meta.get("action") or "").strip()
+    executor = str(action_meta.get("executor") or "").strip()
+    tool_name = str(action_meta.get("tool_name") or "").strip()
+    params: Dict[str, object] = {}
+    instructions = str(args.get("instructions") or args.get("request") or "").strip()
+    output = str(args.get("output") or "").strip()
+
+    if tool_name == "gmail_find_email":
+        query = str(args.get("query") or args.get("search_string") or args.get("searchString") or args.get("search") or "").strip()
+        sender = str(args.get("from") or args.get("sender") or "").strip()
+        if sender and not query:
+            query = f"from:{sender}"
+        elif sender and "from:" not in query.lower():
+            query = f"from:{sender} {query}".strip()
+        if query:
+            topic_match = re.search(r"\b(?:about|regarding|concerning|with subject|subject)\s+(.+?)(?:[.!?]\s*)?$", query, flags=re.I)
+            if topic_match and not any(marker in query.lower() for marker in ("from:", "to:", "subject:", "label:", "newer", "older", "after:", "before:")):
+                topic = topic_match.group(1).strip(" .?!")
+                topic = re.sub(r"^(?:the|a|an)\s+", "", topic, flags=re.I).strip()
+                if topic:
+                    query = topic
+        if not query:
+            query = instructions or "latest email"
+        params["query"] = query
+        instructions = instructions or f"Find Gmail email matching: {query}"
+        output = output or "Return the matching email details, including sender, subject, date, and snippet/body if available."
+    elif tool_name == "gmail_send_email":
+        for key in ("to", "cc", "bcc", "subject", "body", "body_type", "reply_to"):
+            value = args.get(key)
+            if value not in (None, ""):
+                params[key] = value
+        if "body_type" not in params:
+            params["body_type"] = "plain"
+        instructions = instructions or "Send the Gmail message with the supplied fields."
+        output = output or "Return send status and message identifiers."
+    else:
+        raw_params = args.get("params") if isinstance(args.get("params"), dict) else {}
+        params.update(raw_params)
+        for key, value in args.items():
+            if key in {"instructions", "request", "output", "params"}:
+                continue
+            params.setdefault(key, value)
+        instructions = instructions or f"Run Zapier (beta) action {tool_name}."
+        output = output or "Return the action result."
+
+    return {
+        "selected_api": selected_api,
+        "action": action_key,
+        "instructions": instructions,
+        "params": params,
+        "output": output,
+    }
+
+
+def _execute_zapier_enabled_action(
+    pairing_state: Dict[str, object],
+    tool_name: str,
+    user_args: Dict[str, object],
+    preferred_executor: str = "",
+    *,
+    call_timeout: int = 60,
+) -> Dict[str, object]:
+    meta = _zapier_resolve_enabled_action(pairing_state, tool_name, call_timeout=call_timeout)
+    executor = str(meta.get("executor") or preferred_executor or "").strip()
+    if preferred_executor and executor and executor != preferred_executor:
+        raise BridgeError(f"zapier_action_executor_mismatch: expected {preferred_executor}, got {executor}")
+    if not executor:
+        raise BridgeError(f"zapier_action_executor_missing: {tool_name}")
+    executor_args = _zapier_build_executor_arguments(meta, user_args)
+    result = _zapier_mcp_session_call(pairing_state, "tools/call", {
+        "name": executor,
+        "arguments": executor_args,
+    }, call_timeout=call_timeout)
+    return {
+        "executor": executor,
+        "arguments": executor_args,
+        "result": result,
+        "action": meta,
+    }
+
+
+def _execute_approved_zapier_action_run(record: Dict[str, object], pairing_state: Dict[str, object]) -> Dict[str, object]:
+    proposed = record.get("proposed_action") if isinstance(record.get("proposed_action"), dict) else {}
+    proposed_tool = str(proposed.get("tool") or "").strip()
+    _, provider_tool = _parse_mcp_tool(proposed_tool) if proposed_tool.startswith("mcp.") else ("zapier", "actions.run")
+    args = normalize_zapier_args(provider_tool, proposed.get("args") if isinstance(proposed.get("args"), dict) else {})
+    tool_name = str(args.get("name") or "").strip()
+    tool_args = args.get("arguments") if isinstance(args.get("arguments"), dict) else {}
+    if not tool_name:
+        raise BridgeError("zapier_tool_name_required")
+    preferred = "execute_zapier_write_action" if provider_tool == "actions.execute_write" else ""
+    execution = _execute_zapier_enabled_action(
+        pairing_state,
+        tool_name,
+        tool_args,
+        preferred_executor=preferred,
+        call_timeout=60,
+    )
+    return {
+        "provider": "zapier",
+        "tool": provider_tool,
+        "zapier_tool": tool_name,
+        "zapier_executor": execution.get("executor"),
+        "status": "completed",
+        "arguments": execution.get("arguments") if isinstance(execution.get("arguments"), dict) else tool_args,
+        "result": execution.get("result") if isinstance(execution.get("result"), dict) else {},
+    }
+
+
+def _parse_mcp_tool(tool: str) -> Tuple[str, str]:
+    txt = str(tool or "").strip()
+    parts = txt.split(".")
+    if len(parts) < 3 or parts[0] != "mcp":
+        raise BridgeError(f"Unsupported MCP tool: {tool}")
+    server_key = parts[1].strip().lower()
+    provider_tool = ".".join(parts[2:]).strip()
+    if not server_key or not provider_tool:
+        raise BridgeError(f"Invalid MCP tool: {tool}")
+    return server_key, provider_tool
+
+
+def _mcp_server_public_config(server_key: str, cfg: Dict[str, object]) -> Dict[str, object]:
+    allowed_tools = [str(x or "").strip() for x in (cfg.get("allowed_tools") or ()) if str(x or "").strip()]
+    write_tools = [str(x or "").strip() for x in (cfg.get("write_tools") or ()) if str(x or "").strip()]
+    approval_tools = [str(x or "").strip() for x in (cfg.get("approval_required") or ()) if str(x or "").strip()]
+    blocked_write_tools = [tool for tool in write_tools if tool not in set(approval_tools)]
+    return {
+        "server": server_key,
+        "displayName": str(cfg.get("display_name") or server_key).strip(),
+        "bridgeId": str(cfg.get("bridge_id") or "").strip(),
+        "riskTier": str(cfg.get("risk_tier") or "").strip(),
+        "status": str(cfg.get("status") or "").strip() or "configured",
+        "phase1Enabled": bool(cfg.get("phase_1_enabled")),
+        "allowedTools": allowed_tools,
+        "approvalRequiredTools": approval_tools,
+        "writeToolsDeniedInPhase1": blocked_write_tools,
+    }
+
+
+def _normalize_slack_message_post_args(args: Dict[str, object]) -> Dict[str, object]:
+    raw = dict(args or {})
+    text = str(raw.get("text") or "").strip()
+    channel = str(raw.get("channel") or raw.get("channel_id") or raw.get("channelID") or "").strip()
+    if text and not channel:
+        match = re.search(r"(?<!\w)#([A-Za-z0-9][A-Za-z0-9_-]{0,78})\b", text)
+        if match:
+            channel = f"#{match.group(1)}"
+            text = (text[:match.start()] + text[match.end():]).strip()
+    cleaned = re.sub(r"^\s*(post|send|publish)\s+", "", text, flags=re.I).strip()
+    cleaned = re.sub(r"\s+(to|in|on)\s+slack\s*$", "", cleaned, flags=re.I).strip()
+    cleaned = re.sub(r"\s+(to|in|on)\s*$", "", cleaned, flags=re.I).strip()
+    cleaned = re.sub(r"^\s*(a\s+)?message\s+", "", cleaned, flags=re.I).strip()
+    normalized = dict(raw)
+    normalized["text"] = (cleaned or text)[:4000]
+    if channel:
+        normalized["channel"] = channel
+    return normalized
+
+
+def normalize_mcp_action_args(provider: str, provider_tool: str, args: object) -> Dict[str, object]:
+    arg_obj = args if isinstance(args, dict) else {}
+    if provider == "slack" and provider_tool == "messages.post":
+        return _normalize_slack_message_post_args(arg_obj)
+    if provider == "slack" and provider_tool in {"channels.history", "conversations.history"}:
+        return _normalize_slack_history_args(arg_obj)
+    if provider == "github":
+        return normalize_github_args(provider_tool, arg_obj)
+    if provider == "zapier":
+        return normalize_zapier_args(provider_tool, arg_obj)
+    return dict(arg_obj)
+
+
+def build_mcp_action_envelope(call: BridgeCall, pairing_state: Dict[str, object]) -> Dict[str, object]:
+    raw = call.raw if isinstance(call.raw, dict) else {}
+    sentienta_meta = raw.get("_sentienta") if isinstance(raw.get("_sentienta"), dict) else {}
+    server_key = ""
+    provider_tool = ""
+    if call.tool != "mcp.registry.list_servers":
+        server_key, provider_tool = _parse_mcp_tool(call.tool)
+    else:
+        provider_tool = "registry.list_servers"
+    cfg = MCP_SERVER_REGISTRY.get(server_key) if server_key else {}
+    risk_tier = str((cfg or {}).get("risk_tier") or "registry").strip()
+    write_tools = {str(x or "").strip() for x in ((cfg or {}).get("write_tools") or ())}
+    normalized_args = normalize_mcp_action_args(server_key or "registry", provider_tool, call.args)
+    return {
+        "request_id": str(raw.get("request_id") or raw.get("requestID") or sentienta_meta.get("requestID") or call.msg_id).strip(),
+        "session_id": str(raw.get("session_id") or raw.get("sessionID") or sentienta_meta.get("sessionID") or "").strip(),
+        "user_id": str(raw.get("user_id") or raw.get("userID") or sentienta_meta.get("userID") or "").strip(),
+        "workroom_id": str(raw.get("workroom_id") or raw.get("workroomID") or sentienta_meta.get("workroomID") or "").strip(),
+        "agent_id": str(raw.get("agent_id") or raw.get("agentID") or sentienta_meta.get("agentID") or "").strip(),
+        "workflow_id": str(raw.get("workflow_id") or raw.get("workflowID") or sentienta_meta.get("workflowID") or "").strip(),
+        "bridge_id": str(call.bridge_id or "").strip(),
+        "service_family": MCP_PREVIEW_SERVICE,
+        "provider": server_key or "registry",
+        "tool": provider_tool,
+        "full_tool": str(call.tool or "").strip(),
+        "action_category": "write" if provider_tool in write_tools else "read_only",
+        "risk_tier": risk_tier,
+        "args": normalized_args,
+        "bridge_release": dict(pairing_state.get("bridge_release") or {}),
+    }
+
+
+def evaluate_mcp_policy(envelope: Dict[str, object]) -> Dict[str, object]:
+    provider = str(envelope.get("provider") or "").strip().lower()
+    provider_tool = str(envelope.get("tool") or "").strip()
+    bridge_id = str(envelope.get("bridge_id") or "").strip()
+    if provider == "registry" and provider_tool == "registry.list_servers":
+        return {
+            "decision": "allowed",
+            "mode": "read_only",
+            "reason": "registered_read_only_tool",
+            "approval_required": False,
+        }
+    cfg = MCP_SERVER_REGISTRY.get(provider)
+    if not isinstance(cfg, dict):
+        return {
+            "decision": "denied",
+            "mode": "blocked",
+            "reason": "mcp_provider_not_registered",
+            "approval_required": False,
+        }
+    expected_bridge_id = str(cfg.get("bridge_id") or "").strip()
+    is_enterprise_transport = bridge_id.startswith("bridge_")
+    if expected_bridge_id and bridge_id and bridge_id != expected_bridge_id and bridge_id != "desktop_mcp_preview" and not is_enterprise_transport:
+        return {
+            "decision": "denied",
+            "mode": "blocked",
+            "reason": "mcp_bridge_id_mismatch",
+            "approval_required": False,
+            "expected_bridge_id": expected_bridge_id,
+        }
+    allowed = {str(x or "").strip() for x in (cfg.get("allowed_tools") or ())}
+    writes = {str(x or "").strip() for x in (cfg.get("write_tools") or ())}
+    approval_required = {str(x or "").strip() for x in (cfg.get("approval_required") or ())}
+    if provider == "zapier" and provider_tool == "actions.run":
+        args = envelope.get("args") if isinstance(envelope.get("args"), dict) else {}
+        zapier_action = str(args.get("name") or "").strip().lower()
+        read_markers = ("find", "search", "read", "list", "get", "lookup", "retrieve")
+        write_markers = ("send", "create", "write", "update", "delete", "reply", "post")
+        if zapier_action and any(marker in zapier_action for marker in read_markers) and not any(marker in zapier_action for marker in write_markers):
+            return {
+                "decision": "allowed",
+                "mode": "read_only",
+                "reason": "zapier_read_action",
+                "approval_required": False,
+            }
+        return {
+            "decision": "approval_required",
+            "mode": "human_approval",
+            "reason": "human_approval_required",
+            "approval_required": True,
+        }
+    if provider_tool in writes:
+        if provider_tool in approval_required:
+            return {
+                "decision": "approval_required",
+                "mode": "human_approval",
+                "reason": "human_approval_required",
+                "approval_required": True,
+            }
+        return {
+            "decision": "denied",
+            "mode": "blocked",
+            "reason": "write_action_not_enabled",
+            "approval_required": False,
+        }
+    if provider_tool not in allowed:
+        return {
+            "decision": "denied",
+            "mode": "blocked",
+            "reason": "tool_not_in_allowlist",
+            "approval_required": False,
+        }
+    return {
+        "decision": "allowed",
+        "mode": "read_only",
+        "reason": "registered_read_only_tool",
+        "approval_required": False,
+    }
+
+
+def audit_mcp_event(
+    pairing_state: Dict[str, object],
+    envelope: Dict[str, object],
+    policy: Dict[str, object],
+    *,
+    result_status: str = "policy_decision",
+) -> None:
+    try:
+        release = envelope.get("bridge_release") if isinstance(envelope.get("bridge_release"), dict) else {}
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "request_id": str(envelope.get("request_id") or ""),
+            "session_id": str(envelope.get("session_id") or ""),
+            "user_id": str(envelope.get("user_id") or ""),
+            "workroom_id": str(envelope.get("workroom_id") or ""),
+            "agent_id": str(envelope.get("agent_id") or ""),
+            "workflow_id": str(envelope.get("workflow_id") or ""),
+            "bridge_id": str(envelope.get("bridge_id") or ""),
+            "bridge_version": str(release.get("bridgeVersion") or ""),
+            "bridge_channel": str(release.get("bridgeChannel") or ""),
+            "bridge_family": str(release.get("bridgeFamily") or ""),
+            "governance_schema_version": str(release.get("governanceSchemaVersion") or ""),
+            "service_family": MCP_PREVIEW_SERVICE,
+            "provider": str(envelope.get("provider") or ""),
+            "tool": str(envelope.get("tool") or ""),
+            "action_category": str(envelope.get("action_category") or ""),
+            "risk_tier": str(envelope.get("risk_tier") or ""),
+            "policy_decision": str(policy.get("decision") or ""),
+            "policy_reason": str(policy.get("reason") or ""),
+            "approval_decision": "not_required" if not bool(policy.get("approval_required")) else "required",
+            "result_status": str(result_status or ""),
+        }
+        events = _mcp_audit_events(pairing_state)
+        events.append(record)
+        if len(events) > 250:
+            del events[:-250]
+    except Exception:
+        pass
+
+
+def execute_mcp_call(call: BridgeCall, pairing_state: Dict[str, object]) -> Dict[str, object]:
+    envelope = build_mcp_action_envelope(call, pairing_state)
+    policy = evaluate_mcp_policy(envelope)
+    audit_mcp_event(pairing_state, envelope, policy)
+    policy_decision = str(policy.get("decision") or "").strip()
+    if policy_decision == "approval_required":
+        server_key, provider_tool = _parse_mcp_tool(call.tool)
+        cfg = MCP_SERVER_REGISTRY.get(server_key)
+        public_cfg = _mcp_server_public_config(server_key, cfg if isinstance(cfg, dict) else {})
+        approval_record = _record_mcp_approval_required(pairing_state, envelope, policy)
+        result = {
+            "tool": call.tool,
+            "status": "approval_required",
+            "service_family": MCP_PREVIEW_SERVICE,
+            "phase": "phase_2_approval_required",
+            "approval_id": str(approval_record.get("approval_id") or ""),
+            "server": public_cfg,
+            "proposed_action": {
+                "provider": server_key,
+                "tool": provider_tool,
+                "args": envelope.get("args") if isinstance(envelope.get("args"), dict) else {},
+            },
+            "policy": policy,
+            "audit": {"shape": "mcp-governance-v1"},
+        }
+        audit_mcp_event(pairing_state, envelope, policy, result_status="approval_required")
+        return result
+
+    if policy_decision != "allowed":
+        audit_mcp_event(pairing_state, envelope, policy, result_status="denied")
+        raise BridgeError(f"MCP policy denied: {policy.get('reason') or 'denied'}")
+
+    if call.tool == "mcp.registry.list_servers":
+        servers = [
+            _mcp_server_public_config(key, cfg)
+            for key, cfg in sorted(MCP_SERVER_REGISTRY.items())
+            if isinstance(cfg, dict) and bool(cfg.get("phase_1_enabled"))
+        ]
+        result = {
+            "tool": call.tool,
+            "status": "completed",
+            "service_family": MCP_PREVIEW_SERVICE,
+            "phase": "phase_1_read_only",
+            "servers": servers,
+            "policy": policy,
+            "audit": {"shape": "mcp-governance-v1"},
+        }
+        audit_mcp_event(pairing_state, envelope, policy, result_status="success")
+        return result
+
+    server_key, provider_tool = _parse_mcp_tool(call.tool)
+    cfg = MCP_SERVER_REGISTRY.get(server_key)
+    if not isinstance(cfg, dict):
+        raise BridgeError("MCP provider not registered")
+    public_cfg = _mcp_server_public_config(server_key, cfg)
+    if provider_tool == "tools.list":
+        if server_key == "zapier":
+            tools_result = execute_zapier_tools_list(call, pairing_state)
+            result = {
+                **tools_result,
+                "tool": call.tool,
+                "status": "completed",
+                "service_family": MCP_PREVIEW_SERVICE,
+                "phase": "phase_5_read_only",
+                "server": public_cfg,
+                "policy": policy,
+                "audit": {"shape": "mcp-governance-v1"},
+            }
+            audit_mcp_event(pairing_state, envelope, policy, result_status="success")
+            return result
+        result = {
+            "tool": call.tool,
+            "status": "completed",
+            "service_family": MCP_PREVIEW_SERVICE,
+            "phase": "phase_1_read_only",
+            "server": public_cfg,
+            "allowed_tools": public_cfg["allowedTools"],
+            "approval_required_tools": public_cfg["approvalRequiredTools"],
+            "write_tools_denied_in_phase_1": public_cfg["writeToolsDeniedInPhase1"],
+            "policy": policy,
+            "audit": {"shape": "mcp-governance-v1"},
+        }
+        audit_mcp_event(pairing_state, envelope, policy, result_status="success")
+        return result
+    if server_key == "zapier" and provider_tool == "actions.list_enabled":
+        action_result = execute_zapier_enabled_actions_list(call, pairing_state)
+        result = {
+            **action_result,
+            "tool": call.tool,
+            "server": public_cfg,
+            "policy": policy,
+            "audit": {"shape": "mcp-governance-v1"},
+        }
+        audit_mcp_event(pairing_state, envelope, policy, result_status="success")
+        return result
+    if server_key == "zapier" and provider_tool == "actions.discover":
+        action_result = execute_zapier_tool_call(
+            call,
+            pairing_state,
+            provider_tool,
+            "discover_zapier_actions",
+            normalize_mcp_action_args(server_key, provider_tool, call.args),
+            phase="phase_5_read_only",
+        )
+        result = {
+            **action_result,
+            "tool": call.tool,
+            "server": public_cfg,
+            "policy": policy,
+            "audit": {"shape": "mcp-governance-v1"},
+        }
+        audit_mcp_event(pairing_state, envelope, policy, result_status="success")
+        return result
+    if server_key == "zapier" and provider_tool == "actions.execute_read":
+        action_result = execute_zapier_action_read(call, pairing_state)
+        result = {
+            **action_result,
+            "tool": call.tool,
+            "server": public_cfg,
+            "policy": policy,
+            "audit": {"shape": "mcp-governance-v1"},
+        }
+        audit_mcp_event(pairing_state, envelope, policy, result_status="success")
+        return result
+    if server_key == "zapier" and provider_tool == "actions.run" and policy_decision == "allowed":
+        action_result = execute_zapier_action_read(call, pairing_state)
+        result = {
+            **action_result,
+            "tool": call.tool,
+            "server": public_cfg,
+            "policy": policy,
+            "audit": {"shape": "mcp-governance-v1"},
+        }
+        audit_mcp_event(pairing_state, envelope, policy, result_status="success")
+        return result
+    if provider_tool == "status" or provider_tool == "server.status":
+        result = {
+            "tool": call.tool,
+            "status": "completed",
+            "service_family": MCP_PREVIEW_SERVICE,
+            "phase": "phase_1_read_only",
+            "server": public_cfg,
+            "server_status": public_cfg["status"],
+            "policy": policy,
+            "audit": {"shape": "mcp-governance-v1"},
+        }
+        audit_mcp_event(pairing_state, envelope, policy, result_status="success")
+        return result
+    if server_key == "slack" and provider_tool in {"channels.history", "conversations.history"}:
+        history = execute_slack_channel_history(call, pairing_state)
+        result = {
+            **history,
+            "tool": call.tool,
+            "status": "completed",
+            "service_family": MCP_PREVIEW_SERVICE,
+            "phase": "phase_2_read_only",
+            "server": public_cfg,
+            "policy": policy,
+            "audit": {"shape": "mcp-governance-v1"},
+        }
+        audit_mcp_event(pairing_state, envelope, policy, result_status="success")
+        return result
+    if server_key == "github" and provider_tool == "repositories.get":
+        repo = execute_github_repository_get(call, pairing_state)
+        result = {
+            **repo,
+            "tool": call.tool,
+            "status": "completed",
+            "service_family": MCP_PREVIEW_SERVICE,
+            "phase": "phase_4_read_only",
+            "server": public_cfg,
+            "policy": policy,
+            "audit": {"shape": "mcp-governance-v1"},
+        }
+        audit_mcp_event(pairing_state, envelope, policy, result_status="success")
+        return result
+    if server_key == "github" and provider_tool == "issues.list":
+        issues = execute_github_issues_list(call, pairing_state)
+        result = {
+            **issues,
+            "tool": call.tool,
+            "status": "completed",
+            "service_family": MCP_PREVIEW_SERVICE,
+            "phase": "phase_4_read_only",
+            "server": public_cfg,
+            "policy": policy,
+            "audit": {"shape": "mcp-governance-v1"},
+        }
+        audit_mcp_event(pairing_state, envelope, policy, result_status="success")
+        return result
+    raise BridgeError(f"Unsupported MCP read-only tool: {call.tool}")
+
+
 def execute_call(
     call: BridgeCall,
     roots: List[Path],
@@ -4205,6 +6170,10 @@ def execute_call(
         if "openclaw_exec" not in selected_services:
             raise BridgeError("Service disabled: openclaw_exec")
         return execute_openclaw_cancel_task(call, pairing_state)
+    if str(call.tool or "").strip().startswith("mcp."):
+        if MCP_PREVIEW_SERVICE not in selected_services:
+            raise BridgeError("Service disabled: mcp")
+        return execute_mcp_call(call, pairing_state)
     raise BridgeError(f"Unsupported tool: {call.tool}")
 
 
@@ -4222,6 +6191,13 @@ def build_result(call: BridgeCall, bridge_id: str, ok: bool, result: Optional[Di
         obj["result"] = result or {}
     else:
         obj["error"] = error
+        if str(call.tool or "").strip().startswith("mcp."):
+            obj["result"] = {
+                "tool": str(call.tool or "").strip(),
+                "status": "failed",
+                "service_family": MCP_PREVIEW_SERVICE,
+                "error": error,
+            }
     return obj
 
 
@@ -4284,6 +6260,128 @@ def post_bridge_result(
         return http_post_json(query_endpoint, payload, headers)
 
 
+def _find_active_query_for_mcp_record(
+    active_queries: Dict[Tuple[str, str], ActiveQuery],
+    record: Dict[str, object],
+) -> Optional[ActiveQuery]:
+    request_id = str(record.get("request_id") or "").strip()
+    workroom_id = str(record.get("workroom_id") or "").strip()
+    if not request_id:
+        return None
+    candidates = []
+    for q in active_queries.values():
+        if str(q.query_id or "").strip() != request_id:
+            continue
+        if workroom_id and str(q.team_name or "").strip() != f"workroom:{workroom_id}":
+            continue
+        candidates.append(q)
+    if not candidates:
+        for q in active_queries.values():
+            if str(q.query_id or "").strip() == request_id:
+                candidates.append(q)
+    candidates.sort(key=lambda q: float(q.registered_ts or q.last_seen_ts or 0), reverse=True)
+    return candidates[0] if candidates else None
+
+
+def post_mcp_governance_event(
+    *,
+    query_endpoint: str,
+    headers: Dict[str, str],
+    event: Dict[str, object],
+    user_id: str = "",
+) -> None:
+    try:
+        payload: Dict[str, object] = {
+            "type": "recordMcpGovernanceEvents",
+            "clientType": "SentientaBridge",
+            "events": [event],
+        }
+        if user_id:
+            payload["userID"] = user_id
+            payload["username"] = user_id
+        http_post_json(query_endpoint, payload, headers)
+    except Exception as e:
+        print(f"[bridge][mcp-audit] durable audit post failed: {e}", flush=True)
+
+
+def mcp_approval_input_preview(provider: str, args: Dict[str, object]) -> Dict[str, object]:
+    provider_txt = str(provider or "").strip().lower()
+    arg_obj = args if isinstance(args, dict) else {}
+    keys_by_provider = {
+        "slack": ("channel", "text"),
+        "github": ("repo", "repository", "title", "body", "state"),
+        "zapier": ("name", "arguments", "reason"),
+    }
+    keys = keys_by_provider.get(provider_txt, ("channel", "text", "repo", "repository", "title", "body", "objective", "limit", "state"))
+    preview: Dict[str, object] = {}
+    for key in keys:
+        if key not in arg_obj:
+            continue
+        value = arg_obj.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            txt = value.strip()
+            if txt:
+                preview[key] = txt[:1000 if key in {"body", "text"} else 300]
+        else:
+            preview[key] = value
+    return preview
+
+
+def post_mcp_approval_decision_governance_event(
+    *,
+    query_endpoint: str,
+    default_headers: Dict[str, str],
+    active_queries: Dict[Tuple[str, str], ActiveQuery],
+    record: Dict[str, object],
+    decision: str,
+    result_status: str,
+    execution_result: Optional[Dict[str, object]] = None,
+) -> None:
+    try:
+        proposed = record.get("proposed_action") if isinstance(record.get("proposed_action"), dict) else {}
+        args = proposed.get("args") if isinstance(proposed.get("args"), dict) else {}
+        q = _find_active_query_for_mcp_record(active_queries, record)
+        stored_headers = record.get("governance_auth_headers") if isinstance(record.get("governance_auth_headers"), dict) else None
+        if has_auth_credential(stored_headers):
+            headers = dict(stored_headers or {})
+        elif q and has_auth_credential(q.auth_headers):
+            headers = dict(q.auth_headers or {})
+        else:
+            headers = default_headers
+        event = {
+            "eventType": "mcp.approval.decision",
+            "source": "local_bridge_approval",
+            "schemaVersion": MCP_GOVERNANCE_SCHEMA_VERSION,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "userID": str(record.get("user_id") or record.get("governance_user_id") or (q.user_id if q else "") or ""),
+            "agentID": str(record.get("agent_id") or ""),
+            "workroomID": str(record.get("workroom_id") or ""),
+            "requestID": str(record.get("request_id") or ""),
+            "sessionID": str(record.get("session_id") or ""),
+            "workflowID": str(record.get("workflow_id") or ""),
+            "approvalID": str(record.get("approval_id") or ""),
+            "bridgeID": str(record.get("bridge_id") or ""),
+            "provider": str(proposed.get("provider") or ""),
+            "tool": str(record.get("full_tool") or ""),
+            "policyDecision": "approval_required",
+            "policyReason": str((record.get("policy") or {}).get("reason") or ""),
+            "approvalDecision": str(decision or ""),
+            "resultStatus": str(result_status or ""),
+            "inputPreview": mcp_approval_input_preview(str(proposed.get("provider") or ""), args),
+            "executionResult": execution_result if isinstance(execution_result, dict) else {},
+        }
+        post_mcp_governance_event(
+            query_endpoint=query_endpoint,
+            headers=headers,
+            event=event,
+            user_id=str(event.get("userID") or ""),
+        )
+    except Exception as e:
+        print(f"[bridge][mcp-audit] approval decision event build failed: {e}", flush=True)
+
+
 def main() -> int:
     args = parse_args()
     roots: List[Path] = []
@@ -4331,6 +6429,7 @@ def main() -> int:
         "bridge_secret_expires_at": 0,
         "paired_at": 0,
         "listen_port": int(args.listen_port),
+        "verbose": bool(args.verbose),
         "media_tokens": {},
         "openclaw_config": {
             "cli_path": str(args.openclaw_cli or "openclaw").strip() or "openclaw",
@@ -4342,17 +6441,32 @@ def main() -> int:
         "openclaw_runtime": {
             "tasks": {},
         },
+        "slack_config": {
+            "token": str(args.slack_token or "").strip(),
+            "default_channel": str(args.slack_default_channel or "").strip(),
+        },
+        "github_config": {
+            "token": str(args.github_token or "").strip(),
+            "default_repo": str(args.github_default_repo or "").strip(),
+        },
+        "zapier_config": {
+            "server_url": str(args.zapier_mcp_server_url or "").strip(),
+            "token": str(args.zapier_mcp_token or "").strip(),
+        },
     }
+    pairing_state["bridge_release"] = bridge_release_metadata(args.bridge_id, selected_services, accepted_bridge_ids)
     pairing_file = persist_pairing_code_file(bridge_id=args.bridge_id, pairing_state=pairing_state)
     if pairing_file is not None:
         print(f"[bridge][pair] pairing code file: {pairing_file}", flush=True)
     if args.team_name and args.query_id:
+        seed_now = time.time()
         seed = ActiveQuery(
             team_name=args.team_name,
             query_id=args.query_id,
             user_id=str(args.user_id or "").strip(),
             dialog_index=-1,
-            last_seen_ts=time.time(),
+            registered_ts=seed_now,
+            last_seen_ts=seed_now,
             auth_headers=headers if has_auth_credential(headers) else None,
         )
         active_queries[(seed.team_name, seed.query_id)] = seed
@@ -4363,6 +6477,7 @@ def main() -> int:
         active_queries=active_queries,
         lock=active_lock,
         default_auth_headers=headers,
+        query_endpoint=args.query_endpoint,
         pairing_state=pairing_state,
         roots=roots,
         selected_services=selected_services,
@@ -4390,7 +6505,11 @@ def main() -> int:
     try:
         while True:
             with active_lock:
-                snapshot = list(active_queries.values())
+                snapshot = sorted(
+                    list(active_queries.values()),
+                    key=lambda q: (float(q.registered_ts or 0.0), float(q.last_seen_ts or 0.0)),
+                    reverse=True,
+                )
             loop_sleep = max(0.1, args.poll_ms / 1000.0)
 
             for q in snapshot:
@@ -4408,6 +6527,7 @@ def main() -> int:
                 try:
                     # New path: poll Core outbox channel for bridge-targeted messages.
                     outbox_messages: List[object] = []
+                    mcp_any_pending = False
                     for poll_bridge_id in accepted_bridge_ids:
                         debug_meta: Dict[str, object] = {}
                         backend_debug_version = ""
@@ -4440,6 +6560,19 @@ def main() -> int:
                             debug_meta = outbox_resp.get("debug")
                         elif isinstance(parsed_body.get("debug"), dict):
                             debug_meta = parsed_body.get("debug")
+                        if isinstance(debug_meta, dict):
+                            try:
+                                sample = debug_meta.get("sample") if isinstance(debug_meta.get("sample"), list) else []
+                                current_pending = any(
+                                    str((item or {}).get("status") or "").strip().lower() == "pending"
+                                    and str((item or {}).get("queryID") or "").strip() == q.query_id
+                                    and not bool((item or {}).get("expired"))
+                                    for item in sample
+                                    if isinstance(item, dict)
+                                )
+                                mcp_any_pending = mcp_any_pending or current_pending
+                            except Exception:
+                                pass
 
                         backend_debug_version = str(
                             outbox_resp.get("backendDebugVersion")
@@ -4492,14 +6625,15 @@ def main() -> int:
                         log(f"[bridge] msgs team={q.team_name} query={q.query_id}: {preview}", verbose=True)
                     bridge_calls.extend(extract_bridge_calls_from_messages(outbox_messages))
 
-                    # Legacy path: still poll dialog retrieve endpoint for compatibility.
-                    resp = poll_dialog(
-                        retrieve_endpoint=args.retrieve_endpoint,
-                        headers=poll_headers,
-                        team_name=q.team_name,
-                        query_id=q.query_id,
-                        dialog_index=q.dialog_index,
-                    )
+                    resp = {"dialogIndex": q.dialog_index, "body": ""}
+                    if args.enable_legacy_dialog_calls:
+                        resp = poll_dialog(
+                            retrieve_endpoint=args.retrieve_endpoint,
+                            headers=poll_headers,
+                            team_name=q.team_name,
+                            query_id=q.query_id,
+                            dialog_index=q.dialog_index,
+                        )
                     q.poll_errors = 0
                 except BridgeError as e:
                     q.poll_errors += 1
@@ -4563,6 +6697,11 @@ def main() -> int:
                 # Always keep legacy parser as a fallback until outbox delivery is fully reliable.
                 calls = list(bridge_calls)
                 calls.extend(extract_bridge_calls(body))
+                if bridge_calls:
+                    q.mcp_handled_count += len(bridge_calls)
+                    q.mcp_empty_polls_after_handled = 0
+                elif q.mcp_handled_count > 0 and not mcp_any_pending:
+                    q.mcp_empty_polls_after_handled += 1
                 # Only log parser miss if body appears to contain a true bridge_call type payload.
                 bridge_type_marker = '"type"' in body and ("bridge_call" in body or "&quot;bridge_call&quot;" in body)
                 if args.verbose and bridge_type_marker and not calls:
@@ -4668,6 +6807,15 @@ def main() -> int:
                                 f"result_keys={list(result.keys()) if isinstance(result, dict) else []}",
                                 verbose=True,
                             )
+                        if isinstance(result, dict) and str(result.get("status") or "").strip() == "approval_required":
+                            attach_mcp_approval_governance_context(
+                                pairing_state,
+                                str(result.get("approval_id") or ""),
+                                team_name=q.team_name,
+                                query_id=q.query_id,
+                                user_id=q.user_id,
+                                auth_headers=poll_headers,
+                            )
                         result_obj = build_result(call, response_bridge_id, ok=True, result=result)
                         # Remember terminal OpenClaw completion so we can retire noisy post-completion chatter.
                         if call.tool == "openclaw.get_status" and isinstance(result, dict):
@@ -4735,6 +6883,7 @@ def main() -> int:
 
                     try:
                         result_source = _bridge_call_source_name(call.raw)
+                        post_started = time.time()
                         post_resp = post_bridge_result(
                             query_endpoint=args.query_endpoint,
                             headers=poll_headers,
@@ -4746,10 +6895,12 @@ def main() -> int:
                             result_obj=result_obj,
                             user_id=q.user_id,
                         )
+                        post_duration_ms = int((time.time() - post_started) * 1000)
                         if args.verbose:
                             log(
                                 f"[bridge] post msg_id={call.msg_id} queued={post_resp.get('queued')} "
-                                f"total={post_resp.get('total')} errors={post_resp.get('errors')}",
+                                f"total={post_resp.get('total')} errors={post_resp.get('errors')} "
+                                f"post_ms={post_duration_ms}",
                                 verbose=True,
                             )
                             log(f"[bridge] posted bridge_result msg_id={call.msg_id} resp={str(post_resp)[:160]}", verbose=True)
@@ -4764,6 +6915,7 @@ def main() -> int:
                                 "queued": post_resp.get("queued"),
                                 "total": post_resp.get("total"),
                                 "errors": post_resp.get("errors"),
+                                "postDurationMs": post_duration_ms,
                             },
                         )
                     except BridgeError as e:
@@ -4793,6 +6945,14 @@ def main() -> int:
                     # Do not retire solely on terminal OpenClaw status.
                     # The server may still need to post final dialog content and EOD.
                     pass
+                elif (
+                    not args.enable_legacy_dialog_calls
+                    and q.mcp_handled_count > 0
+                    and q.mcp_empty_polls_after_handled >= 3
+                ):
+                    with active_lock:
+                        active_queries.pop((q.team_name, q.query_id), None)
+                    log(f"[bridge] retired idle MCP query team={q.team_name} query={q.query_id}", verbose=True)
 
             time.sleep(loop_sleep)
     finally:
