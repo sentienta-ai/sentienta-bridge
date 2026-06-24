@@ -5,6 +5,7 @@ import json
 import os
 import platform
 import socket
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -458,6 +459,8 @@ class EnterpriseBridgeWorker:
         self.selected_services = resolve_selected_services(args.service, self.bridge_id)
         self.cached_openclaw_agents = []
         self.last_openclaw_agents_refresh = 0.0
+        self.execution_threads = {}
+        self.execution_threads_lock = threading.Lock()
         self.pairing_state = {
             "verbose": bool(args.verbose),
             "openclaw_config": {
@@ -494,20 +497,6 @@ class EnterpriseBridgeWorker:
                 f"zapier_token={bool(str(args.zapier_mcp_token or '').strip())}",
                 flush=True,
             )
-
-    def prompt_for_credentials(self, reason: str = "", ask_username: bool = False, username_default: str = ""):
-        if reason:
-            print(f"[enterprise-bridge] {reason}", flush=True)
-        username = self.admin_username
-        if ask_username or not username:
-            username = _prompt_required("Enterprise admin username", default=username_default)
-        password = _prompt_required("Enterprise admin password", secret=True)
-        self.admin_username = username
-        self.owner_user_id = str(self.args.owner_user_id or self.admin_username).strip()
-        self.session.update_credentials(username, password, clear_cached_session=True)
-        self.config["adminUsername"] = username
-        self.config["workerUsername"] = username
-        _save_json_file(self.config_path, self.config)
 
     def prompt_for_credentials(self, reason: str = "", ask_username: bool = False, username_default: str = ""):
         if reason:
@@ -799,6 +788,18 @@ class EnterpriseBridgeWorker:
             "status": "online",
             "capabilities": self.selected_services,
             "openclawAgents": openclaw_agents,
+            "openclawAgentsUpdatedAt": int(self.last_openclaw_agents_refresh or time.time()),
+        }
+        return self._query(payload)
+
+    def mark_offline(self):
+        payload = {
+            "type": "heartbeatBridgeWorker",
+            "bridgeId": self.bridge_id,
+            "ownerUserId": self.owner_user_id,
+            "status": "offline",
+            "capabilities": self.selected_services,
+            "openclawAgents": self._cached_openclaw_agents_snapshot(),
             "openclawAgentsUpdatedAt": int(self.last_openclaw_agents_refresh or time.time()),
         }
         return self._query(payload)
@@ -1102,6 +1103,37 @@ class EnterpriseBridgeWorker:
                 "reason": str(e),
             }
 
+    def _cleanup_execution_threads(self):
+        try:
+            with self.execution_threads_lock:
+                done = [key for key, thread in self.execution_threads.items() if not thread.is_alive()]
+                for key in done:
+                    self.execution_threads.pop(key, None)
+        except Exception as e:
+            print(f"[enterprise-bridge] execution thread cleanup failed: {e}", flush=True)
+
+    def _execute_message_threaded(self, msg: Dict[str, object]) -> None:
+        msg_id = str((msg or {}).get("msg_id") or (msg or {}).get("call_id") or uuid.uuid4().hex).strip()
+
+        def _runner():
+            try:
+                self._execute_message(msg)
+            except Exception as e:
+                print(f"[enterprise-bridge] execute failed msg_id={msg_id} err={e}", flush=True)
+            finally:
+                try:
+                    with self.execution_threads_lock:
+                        self.execution_threads.pop(msg_id, None)
+                except Exception:
+                    pass
+
+        with self.execution_threads_lock:
+            if msg_id in self.execution_threads:
+                return
+            thread = threading.Thread(target=_runner, name=f"sentienta-bridge-job-{msg_id[:24]}", daemon=True)
+            self.execution_threads[msg_id] = thread
+            thread.start()
+
     def run(self):
         verbose = bool(self.args.verbose)
         log(f"[enterprise-bridge] bridge_id={self.bridge_id} services={','.join(self.selected_services)}", verbose)
@@ -1122,10 +1154,14 @@ class EnterpriseBridgeWorker:
                     msg_ids = [str((m or {}).get("msg_id") or (m or {}).get("call_id") or "").strip() for m in messages]
                     log(f"[enterprise-bridge] polled {len(messages)} job(s) msg_ids={msg_ids}", verbose)
                 for msg in messages:
-                    try:
-                        self._execute_message(msg)
-                    except Exception as e:
-                        print(f"[enterprise-bridge] execute failed msg_id={str((msg or {}).get('msg_id') or '').strip()} err={e}", flush=True)
+                    if self.args.once:
+                        try:
+                            self._execute_message(msg)
+                        except Exception as e:
+                            print(f"[enterprise-bridge] execute failed msg_id={str((msg or {}).get('msg_id') or '').strip()} err={e}", flush=True)
+                    else:
+                        self._execute_message_threaded(msg)
+                self._cleanup_execution_threads()
             except Exception as e:
                 print(f"[enterprise-bridge] loop error: {e}", flush=True)
             if self.args.once:
@@ -1136,7 +1172,14 @@ class EnterpriseBridgeWorker:
 def main() -> int:
     args = parse_args()
     worker = EnterpriseBridgeWorker(args)
-    worker.run()
+    try:
+        worker.run()
+    finally:
+        try:
+            result = worker.mark_offline()
+            log(f"[enterprise-bridge] offline={json.dumps(result, ensure_ascii=False)}", bool(args.verbose))
+        except Exception as e:
+            print(f"[enterprise-bridge] offline update failed: {e}", flush=True)
     return 0
 
 

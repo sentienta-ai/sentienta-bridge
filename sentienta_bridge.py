@@ -3572,6 +3572,10 @@ def _oc_try_create_agent(cli_path: str, agent_id: str, cfg: Optional[Dict[str, o
             if rc == 0:
                 log(f"[bridge][oc] created agent_id={aid} via cmd={subargs}", verbose=True)
                 return True
+            combined = "\n".join([str(out or ""), str(err or "")]).strip().lower()
+            if "already exists" in combined and aid.lower() in combined:
+                log(f"[bridge][oc] adopted existing agent_id={aid} via cmd={subargs}", verbose=True)
+                return True
             log(
                 f"[bridge][oc] create attempt failed agent_id={aid} cmd={subargs} rc={rc} err={str(err or '')[:180]}",
                 verbose=True,

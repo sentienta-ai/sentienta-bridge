@@ -2,6 +2,13 @@
 
 This note tracks the release shape for Desktop Bridge v2, Enterprise Bridge, Workrooms, and brokered services.
 
+
+## June 24, 2026 Reliability Update
+
+- Enterprise Bridge now runs claimed jobs on background worker threads so heartbeat and polling continue while long OpenClaw tasks are running.
+- OpenClaw agent provisioning now adopts an already-existing matching OpenClaw agent instead of treating that condition as a fatal create failure.
+- This update fixes cases where a bridge appeared offline during a long task or where an existing OpenClaw agent prevented a workroom agent from running.
+
 ## Public Bridge Package
 
 Publish these files to the public `sentienta-bridge` GitHub repository:
