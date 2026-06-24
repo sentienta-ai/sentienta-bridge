@@ -77,7 +77,7 @@ MCP_SERVER_REGISTRY: Dict[str, Dict[str, object]] = {
         "risk_tier": "code_change",
         "status": "configured",
         "phase_1_enabled": True,
-        "allowed_tools": ("tools.list", "status", "server.status", "issues.list", "repositories.get"),
+        "allowed_tools": ("tools.list", "status", "server.status", "issues.list", "repositories.get", "commits.list", "contents.get"),
         "write_tools": ("issues.create", "pull_requests.create"),
         "approval_required": ("issues.create",),
     },
@@ -5015,6 +5015,82 @@ def execute_github_repository_get(call: BridgeCall, pairing_state: Dict[str, obj
     }
 
 
+def execute_github_commits_list(call: BridgeCall, pairing_state: Dict[str, object]) -> Dict[str, object]:
+    cfg = _github_config(pairing_state)
+    args = call.args if isinstance(call.args, dict) else {}
+    owner, name, full_name = _resolve_github_repo(args, pairing_state)
+    try:
+        limit = max(1, min(int(args.get("limit") or 5), 20))
+    except Exception:
+        limit = 5
+    params = {"per_page": str(limit)}
+    branch = str(args.get("branch") or args.get("sha") or "").strip()
+    if branch:
+        params["sha"] = branch
+    obj = _github_api_request("GET", f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}/commits", cfg["token"], params=params)
+    if not isinstance(obj, list):
+        raise BridgeError("github_unexpected_commits_response")
+    commits = []
+    for item in obj[:limit]:
+        if not isinstance(item, dict):
+            continue
+        commit = item.get("commit") if isinstance(item.get("commit"), dict) else {}
+        author = commit.get("author") if isinstance(commit.get("author"), dict) else {}
+        message = str(commit.get("message") or "").strip()
+        first_line = message.splitlines()[0].strip() if message else ""
+        commits.append({
+            "sha": str(item.get("sha") or "")[:12],
+            "message": first_line,
+            "author": str(author.get("name") or ""),
+            "date": str(author.get("date") or ""),
+            "html_url": str(item.get("html_url") or ""),
+        })
+    return {
+        "provider": "github",
+        "tool": "commits.list",
+        "status": "completed",
+        "service_family": MCP_PREVIEW_SERVICE,
+        "phase": "phase_4_read_only",
+        "repo": full_name,
+        "commits": commits,
+    }
+
+
+def execute_github_contents_get(call: BridgeCall, pairing_state: Dict[str, object]) -> Dict[str, object]:
+    cfg = _github_config(pairing_state)
+    args = call.args if isinstance(call.args, dict) else {}
+    owner, name, full_name = _resolve_github_repo(args, pairing_state)
+    path = str(args.get("path") or args.get("file") or args.get("filename") or "").strip().lstrip("/")
+    if not path:
+        raise BridgeError("github_path_required")
+    ref = str(args.get("ref") or args.get("branch") or "").strip()
+    params = {"ref": ref} if ref else None
+    obj = _github_api_request("GET", f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}/contents/{quote(path, safe='/')}", cfg["token"], params=params)
+    if not isinstance(obj, dict):
+        raise BridgeError("github_unexpected_content_response")
+    if str(obj.get("type") or "").lower() != "file":
+        raise BridgeError("github_content_not_file")
+    encoded = str(obj.get("content") or "")
+    encoding = str(obj.get("encoding") or "").lower()
+    text = ""
+    if encoding == "base64" and encoded:
+        raw = base64.b64decode(re.sub(r"\s+", "", encoded), validate=False)
+        text = raw.decode("utf-8", errors="replace")
+    else:
+        text = encoded
+    return {
+        "provider": "github",
+        "tool": "contents.get",
+        "status": "completed",
+        "service_family": MCP_PREVIEW_SERVICE,
+        "phase": "phase_4_read_only",
+        "repo": full_name,
+        "path": path,
+        "html_url": str(obj.get("html_url") or ""),
+        "content": text[:12000],
+        "truncated": len(text) > 12000,
+    }
+
 def execute_github_issues_list(call: BridgeCall, pairing_state: Dict[str, object]) -> Dict[str, object]:
     cfg = _github_config(pairing_state)
     args = normalize_github_args("issues.list", call.args if isinstance(call.args, dict) else {})
@@ -6127,6 +6203,34 @@ def execute_mcp_call(call: BridgeCall, pairing_state: Dict[str, object]) -> Dict
         issues = execute_github_issues_list(call, pairing_state)
         result = {
             **issues,
+            "tool": call.tool,
+            "status": "completed",
+            "service_family": MCP_PREVIEW_SERVICE,
+            "phase": "phase_4_read_only",
+            "server": public_cfg,
+            "policy": policy,
+            "audit": {"shape": "mcp-governance-v1"},
+        }
+        audit_mcp_event(pairing_state, envelope, policy, result_status="success")
+        return result
+    if server_key == "github" and provider_tool == "commits.list":
+        commits = execute_github_commits_list(call, pairing_state)
+        result = {
+            **commits,
+            "tool": call.tool,
+            "status": "completed",
+            "service_family": MCP_PREVIEW_SERVICE,
+            "phase": "phase_4_read_only",
+            "server": public_cfg,
+            "policy": policy,
+            "audit": {"shape": "mcp-governance-v1"},
+        }
+        audit_mcp_event(pairing_state, envelope, policy, result_status="success")
+        return result
+    if server_key == "github" and provider_tool == "contents.get":
+        content = execute_github_contents_get(call, pairing_state)
+        result = {
+            **content,
             "tool": call.tool,
             "status": "completed",
             "service_family": MCP_PREVIEW_SERVICE,

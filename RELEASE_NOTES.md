@@ -9,6 +9,12 @@ This note tracks the release shape for Desktop Bridge v2, Enterprise Bridge, Wor
 - OpenClaw agent provisioning now adopts an already-existing matching OpenClaw agent instead of treating that condition as a fatal create failure.
 - This update fixes cases where a bridge appeared offline during a long task or where an existing OpenClaw agent prevented a workroom agent from running.
 
+
+## June 24, 2026 GitHub Read Tools Update
+
+- GitHub MCP now includes read-only commit listing for release verification and recent-change checks.
+- GitHub MCP now includes read-only repository file access for files such as `README.md` and `RELEASE_NOTES.md`.
+
 ## Public Bridge Package
 
 Publish these files to the public `sentienta-bridge` GitHub repository:
