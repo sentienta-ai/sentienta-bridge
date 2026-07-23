@@ -3656,7 +3656,7 @@ def _oc_smoke_test_template_agent(
         if _oc_is_auth_store_error(combined):
             raise BridgeError(
                 'OpenClaw could not access its auth store at '
-                '"C:\\Users\\Chris\\.openclaw\\identity\\device-auth.json" '
+                '"%USERPROFILE%\\.openclaw\\identity\\device-auth.json" '
                 "(EPERM / access denied). Close or fix the process/file lock and verify the "
                 'OpenClaw CLI can run `openclaw agent --agent main --message "test" --json`.'
             )
