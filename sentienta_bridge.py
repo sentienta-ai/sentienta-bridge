@@ -951,7 +951,7 @@ async function decide(decision) {{
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(raw)
-                
+
             if path != "/health":
                 self._json_response(404, {"ok": False, "error": "not_found"})
                 return
@@ -8456,7 +8456,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-
