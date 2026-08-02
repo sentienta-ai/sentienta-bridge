@@ -122,18 +122,19 @@ def parse_args():
     p.add_argument(
         "--heartbeat-interval-secs",
         type=float,
-        default=float(os.getenv("SENTIENTA_WORKER_HEARTBEAT_INTERVAL_SECS", "15")),
-        help="Heartbeat interval in seconds (default: 15).",
+        default=float(os.getenv("SENTIENTA_WORKER_HEARTBEAT_INTERVAL_SECS", "60")),
+        help="Heartbeat interval in seconds (default: 60).",
     )
     p.add_argument("--limit", type=int, default=10, help="Maximum number of queued jobs to fetch per poll (default: 10).")
+    p.add_argument("--allow-root", action="append", default=[], help="Allowed root dir for Local File Services. Repeatable. Required when --service local_fs is enabled.")
     p.add_argument("--once", action="store_true", help="Run one poll cycle and then exit.")
     p.add_argument("--verbose", action="store_true", help="Enable verbose bridge logging.")
     p.add_argument(
         "--service",
         action="append",
-        choices=["openclaw_exec", "mcp"],
+        choices=["local_fs", "openclaw_exec", "mcp"],
         default=[],
-        help="Enable only the specified service(s). Repeat to enable multiple. Supported services: openclaw_exec, mcp.",
+        help="Enable only the specified service(s). Repeat to enable multiple. Supported services: local_fs, openclaw_exec, mcp.",
     )
     p.add_argument(
         "--openclaw-cli",
@@ -150,6 +151,12 @@ def parse_args():
         type=int,
         default=int(os.getenv("SENTIENTA_OPENCLAW_DEFAULT_TIMEOUT_MS", "210000")),
         help="Default OpenClaw task timeout in milliseconds (default: 210000).",
+    )
+    p.add_argument(
+        "--openclaw-execution-mode",
+        choices=["auto", "cli", "gateway_rpc"],
+        default=os.getenv("SENTIENTA_OPENCLAW_EXECUTION_MODE", "cli"),
+        help="OpenClaw execution mode: cli, gateway_rpc, or auto. Default: cli.",
     )
     p.add_argument(
         "--slack-token",
@@ -180,6 +187,36 @@ def parse_args():
         "--zapier-mcp-token",
         default=os.getenv("SENTIENTA_ZAPIER_MCP_TOKEN", "") or os.getenv("ZAPIER_MCP_TOKEN", ""),
         help="Optional Zapier MCP bearer token for enterprise MCP Zapier tools.",
+    )
+    p.add_argument(
+        "--google-calendar-access-token",
+        default=os.getenv("SENTIENTA_GOOGLE_CALENDAR_ACCESS_TOKEN", "") or os.getenv("GOOGLE_CALENDAR_ACCESS_TOKEN", ""),
+        help="Google OAuth access token for native Google Calendar MCP tools.",
+    )
+    p.add_argument(
+        "--google-calendar-refresh-token",
+        default=os.getenv("SENTIENTA_GOOGLE_CALENDAR_REFRESH_TOKEN", "") or os.getenv("GOOGLE_CALENDAR_REFRESH_TOKEN", ""),
+        help="Google OAuth refresh token for native Google Calendar MCP tools.",
+    )
+    p.add_argument(
+        "--google-calendar-client-id",
+        default=os.getenv("SENTIENTA_GOOGLE_CALENDAR_CLIENT_ID", "") or os.getenv("GOOGLE_CALENDAR_CLIENT_ID", ""),
+        help="Google OAuth client id for refreshing Calendar access.",
+    )
+    p.add_argument(
+        "--google-calendar-client-secret",
+        default=os.getenv("SENTIENTA_GOOGLE_CALENDAR_CLIENT_SECRET", "") or os.getenv("GOOGLE_CALENDAR_CLIENT_SECRET", ""),
+        help="Google OAuth client secret for refreshing Calendar access.",
+    )
+    p.add_argument(
+        "--google-calendar-id",
+        default=os.getenv("SENTIENTA_GOOGLE_CALENDAR_ID", "") or os.getenv("GOOGLE_CALENDAR_ID", "") or "primary",
+        help="Default Google Calendar id for native Calendar MCP tools (default: primary).",
+    )
+    p.add_argument(
+        "--google-calendar-timezone",
+        default=os.getenv("SENTIENTA_GOOGLE_CALENDAR_TIMEZONE", "") or os.getenv("GOOGLE_CALENDAR_TIMEZONE", "") or "America/New_York",
+        help="Default timezone for native Google Calendar MCP tools.",
     )
     p.add_argument("--max-chars-default", type=int, default=40000, help="Default response character limit for tool results.")
     p.add_argument("--max-chars-hard", type=int, default=500000, help="Hard maximum response character limit for tool results.")
@@ -457,8 +494,12 @@ class EnterpriseBridgeWorker:
         if not self.session._cached_session_matches_username():
             self.session.state = {}
         self.selected_services = resolve_selected_services(args.service, self.bridge_id)
+        self.roots = [Path(r).expanduser().resolve() for r in getattr(args, "allow_root", [])]
+        if "local_fs" in self.selected_services and not self.roots:
+            raise SystemExit("ERROR: at least one --allow-root is required when local_fs is enabled")
         self.cached_openclaw_agents = []
         self.last_openclaw_agents_refresh = 0.0
+        self.last_poll_retry_after_secs = 0.0
         self.execution_threads = {}
         self.execution_threads_lock = threading.Lock()
         self.pairing_state = {
@@ -467,7 +508,7 @@ class EnterpriseBridgeWorker:
                 "cli_path": str(args.openclaw_cli or "openclaw").strip() or "openclaw",
                 "default_agent": str(args.openclaw_default_agent or "main").strip() or "main",
                 "default_timeout_ms": int(args.openclaw_default_timeout_ms or 210000),
-                "execution_mode": "cli",
+                "execution_mode": str(args.openclaw_execution_mode or "cli").strip().lower() or "cli",
                 "agents_root": str((Path.home() / ".openclaw" / "agents").resolve()),
             },
             "openclaw_runtime": {"tasks": {}},
@@ -483,6 +524,14 @@ class EnterpriseBridgeWorker:
                 "server_url": str(args.zapier_mcp_server_url or "").strip(),
                 "token": str(args.zapier_mcp_token or "").strip(),
             },
+            "google_calendar_config": {
+                "access_token": str(args.google_calendar_access_token or "").strip(),
+                "refresh_token": str(args.google_calendar_refresh_token or "").strip(),
+                "client_id": str(args.google_calendar_client_id or "").strip(),
+                "client_secret": str(args.google_calendar_client_secret or "").strip(),
+                "calendar_id": str(args.google_calendar_id or "primary").strip() or "primary",
+                "timezone": str(args.google_calendar_timezone or "America/New_York").strip() or "America/New_York",
+            },
             "mcp_audit_events": [],
             "mcp_pending_approvals": {},
         }
@@ -494,7 +543,11 @@ class EnterpriseBridgeWorker:
                 f"github_default_repo={bool(str(args.github_default_repo or '').strip())} "
                 f"zapier_server_url={bool(str(args.zapier_mcp_server_url or '').strip())} "
                 f"zapier_server_url_fp={secret_fingerprint(str(args.zapier_mcp_server_url or '').strip()) or '-'} "
-                f"zapier_token={bool(str(args.zapier_mcp_token or '').strip())}",
+                f"zapier_token={bool(str(args.zapier_mcp_token or '').strip())} "
+                f"google_calendar_access_token={bool(str(args.google_calendar_access_token or '').strip())} "
+                f"google_calendar_refresh_token={bool(str(args.google_calendar_refresh_token or '').strip())} "
+                f"google_calendar_client={bool(str(args.google_calendar_client_id or '').strip() and str(args.google_calendar_client_secret or '').strip())} "
+                f"google_calendar_id={str(args.google_calendar_id or 'primary').strip() or 'primary'}",
                 flush=True,
             )
 
@@ -700,11 +753,7 @@ class EnterpriseBridgeWorker:
                     ask_username=True,
                     username_default="",
                 )
-            elif not str(self.session.password or "").strip():
-                self.prompt_for_credentials(
-                    f"Enter the password for enterprise admin {self.admin_username}.",
-                    ask_username=False,
-                )
+
             try:
                 return self.validate_enterprise_admin()
             except Exception as e:
@@ -734,7 +783,7 @@ class EnterpriseBridgeWorker:
         raise BridgeError(f"Enterprise bridge startup failed after credential retries: {last_error}")
 
     def register(self):
-        openclaw_agents = self._refresh_openclaw_agents_cache(force=True)
+        openclaw_agents = self._cached_openclaw_agents_snapshot()
         if bool(self.args.verbose):
             sample = [
                 {
@@ -765,8 +814,6 @@ class EnterpriseBridgeWorker:
 
     def heartbeat(self):
         openclaw_agents = self._cached_openclaw_agents_snapshot()
-        if not openclaw_agents:
-            openclaw_agents = self._refresh_openclaw_agents_cache(force=True)
         if bool(self.args.verbose):
             sample = [
                 {
@@ -812,6 +859,11 @@ class EnterpriseBridgeWorker:
         }
         body = self._query(payload)
         msgs = body.get("messages")
+        retry_after = body.get("retryAfterSeconds")
+        try:
+            self.last_poll_retry_after_secs = max(0.0, min(float(retry_after or 0), 300.0))
+        except (TypeError, ValueError):
+            self.last_poll_retry_after_secs = 0.0
         debug = body.get("debug") if isinstance(body.get("debug"), dict) else {}
         if bool(self.args.verbose):
             sample = []
@@ -917,7 +969,7 @@ class EnterpriseBridgeWorker:
             else:
                 result = execute_call(
                     call=call,
-                    roots=[],
+                    roots=self.roots,
                     pairing_state=self.pairing_state,
                     selected_services=self.selected_services,
                     max_chars_default=int(self.args.max_chars_default),
@@ -1141,6 +1193,8 @@ class EnterpriseBridgeWorker:
         log(f"[enterprise-bridge] admin validated org={str((ctx.get('org') or {}).get('orgId') or '').strip()}", verbose)
         reg = self.register()
         log(f"[enterprise-bridge] register={json.dumps(reg, ensure_ascii=False)}", verbose)
+        if "openclaw_exec" in self.selected_services:
+            threading.Thread(target=self._refresh_openclaw_agents_cache, kwargs={"force": True}, name="sentienta-bridge-inventory", daemon=True).start()
         last_heartbeat = 0.0
         while True:
             now = time.time()
@@ -1166,7 +1220,10 @@ class EnterpriseBridgeWorker:
                 print(f"[enterprise-bridge] loop error: {e}", flush=True)
             if self.args.once:
                 break
-            time.sleep(max(0.5, float(self.args.poll_interval_secs)))
+            sleep_secs = max(0.5, float(self.args.poll_interval_secs))
+            if not messages and float(self.last_poll_retry_after_secs or 0.0) > 0:
+                sleep_secs = max(sleep_secs, float(self.last_poll_retry_after_secs))
+            time.sleep(sleep_secs)
 
 
 def main() -> int:
@@ -1185,3 +1242,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+

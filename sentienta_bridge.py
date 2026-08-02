@@ -27,8 +27,10 @@ import sys
 import threading
 import time
 import uuid
+import zipfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from http.client import RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -36,6 +38,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
+from xml.etree import ElementTree as nT
 
 
 DEFAULT_QUERY_ENDPOINT = "https://v75rxsd18a.execute-api.us-west-2.amazonaws.com/PROD/query"
@@ -46,18 +49,21 @@ BRIDGE_PROTOCOL_VERSION = "bridge-protocol-v1"
 MCP_GOVERNANCE_SCHEMA_VERSION = "mcp-governance-v1"
 STABLE_BRIDGE_VERSION = "2026-06-01-stable-v1"
 MCP_PREVIEW_BRIDGE_VERSION = "2026-06-03-mcp-preview-v4"
-SUPPORTED_SERVICES = ("openclaw_exec", "mcp")
+SUPPORTED_SERVICES = ("local_fs", "openclaw_exec", "mcp")
 OPENCLAW_EXEC_SERVICE = "openclaw_exec"
 DEFAULT_STABLE_SERVICES = ("openclaw_exec",)
 MCP_PREVIEW_SERVICE = "mcp"
 BRIDGE_ID_SERVICE_POLICY: Dict[str, Tuple[str, ...]] = {
+    "desktop_fs": ("local_fs",),
     "desktop_openclaw": ("openclaw_exec",),
     "desktop_mcp_preview": ("mcp",),
     "desktop_mcp_slack": ("mcp",),
     "desktop_mcp_github": ("mcp",),
     "desktop_mcp_zapier": ("mcp",),
+    "desktop_mcp_google_calendar": ("mcp",),
 }
 SERVICE_TO_BRIDGE_ID: Dict[str, str] = {
+    "local_fs": "desktop_fs",
     "openclaw_exec": "desktop_openclaw",
     "mcp": "desktop_mcp_preview",
 }
@@ -91,6 +97,16 @@ MCP_SERVER_REGISTRY: Dict[str, Dict[str, object]] = {
         "allowed_tools": ("tools.list", "status", "server.status", "actions.list_enabled", "actions.discover", "actions.execute_read"),
         "write_tools": ("actions.run", "actions.execute_write"),
         "approval_required": ("actions.execute_write",),
+    },
+    "google_calendar": {
+        "display_name": "Google Calendar",
+        "bridge_id": "desktop_mcp_google_calendar",
+        "risk_tier": "calendar",
+        "status": "configured",
+        "phase_1_enabled": True,
+        "allowed_tools": ("tools.list", "status", "server.status", "events.list"),
+        "write_tools": ("events.create",),
+        "approval_required": ("events.create",),
     },
 }
 MEDIA_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "pdf"}
@@ -161,6 +177,37 @@ class ActiveQuery:
     show_partial_results: bool = False
     mcp_handled_count: int = 0
     mcp_empty_polls_after_handled: int = 0
+    next_bridge_poll_ts: float = 0.0
+    last_bridge_activity_ts: float = 0.0
+    bridge_idle_polls: int = 0
+
+
+BRIDGE_PrLL_FAST_SnCS = 1.0
+BRIDGE_PrLL_WARM_SnCS = 3.0
+BRIDGE_PrLL_IDLn_SnCS = 12.0
+BRIDGE_PrLL_MAX_SnCS = 30.0
+
+
+def bridge_poll_delay_for_query(q: ActiveQuery, *, had_activity: bool, had_pending: bool) -> float:
+    now = time.time()
+    if had_activity or had_pending:
+        q.last_bridge_activity_ts = now
+        q.bridge_idle_polls = 0
+        return BRIDGE_PrLL_FAST_SnCS
+
+    q.bridge_idle_polls = int(q.bridge_idle_polls or 0) + 1
+    age = max(0.0, now - float(q.registered_ts or now))
+    since_activity = max(0.0, now - float(q.last_bridge_activity_ts or q.registered_ts or now))
+
+    # Newly registered queries may produce a service call after model thinking,
+    # so stay responsive briefly without hammering Lambda several times/second.
+    if age < 30.0:
+        return BRIDGE_PrLL_FAST_SnCS
+    if age < 120.0 or since_activity < 45.0:
+        return BRIDGE_PrLL_WARM_SnCS
+    if q.bridge_idle_polls > 20:
+        return BRIDGE_PrLL_MAX_SnCS
+    return BRIDGE_PrLL_IDLn_SnCS
 
 
 def _bridge_debug_events(pairing_state: Dict[str, object]) -> List[Dict[str, object]]:
@@ -243,6 +290,7 @@ def parse_args() -> argparse.Namespace:
         "Notes:\n"
         "  - If --service is omitted, all supported services are selected (subject to bridge_id policy).\n"
         "  - For public use, pass only --service openclaw_exec.\n"
+        "  - MCP services require sentienta_bridge_enterprise.py (Enterprise Services Bridge mode).\n"
         "  - Start OpenClaw first when using --service openclaw_exec."
     )
     p = argparse.ArgumentParser(
@@ -273,6 +321,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--query-endpoint", default=DEFAULT_QUERY_ENDPOINT)
     p.add_argument("--retrieve-endpoint", default=DEFAULT_RETRIEVE_ENDPOINT)
+    p.add_argument("--allow-root", action="append", default=[], help="Allowed root dir for Local File Services. Repeatable. Required when --service local_fs is enabled.")
     p.add_argument("--listen-port", type=int, default=8765, help="Local bridge registration HTTP port")
     p.add_argument(
         "--pair-passcode-ttl-secs",
@@ -310,9 +359,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--openclaw-execution-mode",
-        choices=["cli"],
+        choices=["auto", "cli", "gateway_rpc"],
         default=os.getenv("SENTIENTA_OPENCLAW_EXECUTION_MODE", "cli"),
-        help="OpenClaw execution mode for public bridge builds. Only cli is supported.",
+        help="OpenClaw execution mode: cli, gateway_rpc, or auto.",
     )
     p.add_argument(
         "--slack-token",
@@ -576,6 +625,8 @@ def _record_pair_failure(pairing_state: Dict[str, object], now: Optional[int] = 
 
 def compute_available_services(selected_services: List[str]) -> List[str]:
     services: List[str] = []
+    if "local_fs" in selected_services:
+        services.append("local_fs")
     if "openclaw_exec" in selected_services:
         services.append("openclaw_exec")
     if MCP_PREVIEW_SERVICE in selected_services:
@@ -632,6 +683,60 @@ def make_registration_handler(
     max_find_results_default: int,
     max_find_results_hard: int,
 ):
+    def _create_pairing_success(requested_caps: List[str]) -> Dict[str, object]:
+        requested_caps = [str(c).strip() for c in (requested_caps if isinstance(requested_caps, list) else []) if str(c).strip()]
+        cap_to_service = {
+            "local_fs": "local_fs",
+            "files": "local_fs",
+            "file_services": "local_fs",
+            "openclaw": "openclaw_exec",
+            "openclaw_exec": "openclaw_exec",
+            "mcp": "mcp",
+            "mcp_preview": "mcp",
+        }
+        requested_services = [cap_to_service[c] for c in requested_caps if c in cap_to_service]
+        enabled_bridge_ids: List[str] = []
+        effective_services = requested_services if requested_services else list(selected_services)
+        for svc in effective_services:
+            bid = SERVICE_TO_BRIDGE_ID.get(svc)
+            if bid and bid in accepted_bridge_ids and bid not in enabled_bridge_ids:
+                enabled_bridge_ids.append(bid)
+        if bridge_id not in enabled_bridge_ids:
+            enabled_bridge_ids.append(bridge_id)
+
+        now = int(time.time())
+        bridge_secret = secrets.token_urlsafe(24)
+        secret_expires_at = now + 8 * 60 * 60
+        pairing_state["bridge_secret"] = bridge_secret
+        pairing_state["bridge_secret_expires_at"] = secret_expires_at
+        pairing_state["paired_at"] = now
+        pairing_state["pair_failures"] = []
+
+        available_services = compute_available_services(selected_services)
+        release_meta = bridge_release_metadata(bridge_id, selected_services, accepted_bridge_ids)
+        result = {
+            "ok": True,
+            "bridgeId": bridge_id,
+            "acceptedBridgeIds": list(accepted_bridge_ids),
+            "release": release_meta,
+            "bridgeSecret": bridge_secret,
+            "enabledBridgeIds": enabled_bridge_ids,
+            "availableServices": list(available_services),
+            "expiresAt": secret_expires_at,
+        }
+        _ = persist_pairing_code_file(bridge_id=bridge_id, pairing_state=pairing_state)
+        return result
+
+    def _pair_requests() -> Dict[str, Dict[str, object]]:
+        requests = pairing_state.get("pair_requests")
+        if not isinstance(requests, dict):
+            requests = {}
+            pairing_state["pair_requests"] = requests
+        now = int(time.time())
+        expired = [rid for rid, item in requests.items() if isinstance(item, dict) and int(item.get("expires_at", 0) or 0) and now > int(item.get("expires_at", 0) or 0)]
+        for rid in expired:
+            requests.pop(rid, None)
+        return requests
     class RegistrationHandler(BaseHTTPRequestHandler):
         def _json_response(self, code: int, payload: Dict[str, object]) -> None:
             raw = json.dumps(payload).encode("utf-8")
@@ -642,6 +747,7 @@ def make_registration_handler(
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Bridge-Secret")
                 self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+                self.send_header("Access-Control-Allow-Private-Network", "true")
                 self.end_headers()
                 self.wfile.write(raw)
             except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
@@ -652,6 +758,7 @@ def make_registration_handler(
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Bridge-Secret")
             self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Private-Network", "true")
             self.end_headers()
 
         def do_GET(self) -> None:  # noqa: N802
@@ -788,6 +895,63 @@ def make_registration_handler(
                     },
                 )
                 return
+            if path == "/pair/status":
+                params = parse_qs(parsed.query or "")
+                request_id = str((params.get("requestId") or [""])[0] or "").strip()
+                item = _pair_requests().get(request_id)
+                if not request_id or not isinstance(item, dict):
+                    self._json_response(404, {"ok": False, "error": "pair_request_not_found"})
+                    return
+                status = str(item.get("status") or "pending").strip() or "pending"
+                if status == "approved" and isinstance(item.get("result"), dict):
+                    self._json_response(200, dict(item.get("result") or {}, status="approved", requestId=request_id))
+                    return
+                self._json_response(200, {"ok": True, "status": status, "requestId": request_id})
+                return
+            if path == "/pair/approve":
+                params = parse_qs(parsed.query or "")
+                request_id = str((params.get("requestId") or [""])[0] or "").strip()
+                item = _pair_requests().get(request_id)
+                if not request_id or not isinstance(item, dict):
+                    body = "<html><body><h2>Request not found</h2><p>This Desktop Automation request expired or was already completed.</p></body></html>"
+                else:
+                    origin = html.escape(str(item.get("origin") or "Sentienta"), quote=True)
+                    services = ", ".join(compute_available_services(selected_services)) or "Desktop Automation"
+                    body = f"""
+<!doctype html>
+<html><head><meta charset='utf-8'><title>Approve Sentienta Desktop Automation</title>
+<style>body{{font-family:Arial,sans-serif;margin:32px;color:#102a43;line-height:1.45}}button{{min-height:40px;padding:0 16px;margin-right:8px;border-radius:8px;border:1px solid #b8c7d3;font-weight:700;cursor:pointer}}button.approve{{background:#0798c1;color:white;border-color:#0798c1}}#status{{margin-top:16px;font-weight:700}}</style></head>
+<body>
+<h2>Approve Sentienta Desktop Automation?</h2>
+<p>Allow <strong>{origin}</strong> to connect this browser to the local Sentienta bridge on this computer.</p>
+<p>Available local services: <strong>{html.escape(services)}</strong></p>
+<button class='approve' onclick="decide('approve')">Approve</button>
+<button onclick="decide('deny')">Deny</button>
+<div id='status'></div>
+<script>
+async function decide(decision) {{
+  const status = document.getElementById('status');
+  status.textContent = decision === 'approve' ? 'Approving...' : 'Denying...';
+  try {{
+    const resp = await fetch('/pair/approve', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{requestId:{json.dumps(request_id)}, decision}})}});
+    const data = await resp.json();
+    if (!resp.ok || data.ok !== true) throw new nrror(data.error || 'Request failed');
+    status.textContent = decision === 'approve' ? 'Approved. You can close this window.' : 'Denied. You can close this window.';
+    setTimeout(() => window.close(), 900);
+  }} catch (error) {{
+    status.textContent = error && error.message ? error.message : 'Could not update approval.';
+  }}
+}}
+</script>
+</body></html>"""
+                raw = body.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(raw)
+                
             if path != "/health":
                 self._json_response(404, {"ok": False, "error": "not_found"})
                 return
@@ -814,7 +978,7 @@ def make_registration_handler(
             )
 
         def do_POST(self) -> None:  # noqa: N802
-            if self.path not in {"/register-query", "/pair", "/unpair", "/run-tool", "/cancel-query", "/mcp-approval"}:
+            if self.path not in {"/register-query", "/pair", "/pair/start", "/pair/approve", "/unpair", "/run-tool", "/cancel-query", "/mcp-approval"}:
                 self._json_response(404, {"ok": False, "error": "not_found"})
                 return
             try:
@@ -832,6 +996,73 @@ def make_registration_handler(
                 self._json_response(400, {"ok": False, "error": "payload_must_be_object"})
                 return
 
+            if self.path == "/pair/start":
+                req_bridge_id = str(payload.get("bridgeId", "") or bridge_id).strip()
+                if req_bridge_id and req_bridge_id not in accepted_bridge_ids:
+                    self._json_response(
+                        409,
+                        {
+                            "ok": False,
+                            "error": "bridge_id_mismatch",
+                            "expectedBridgeId": bridge_id,
+                            "acceptedBridgeIds": list(accepted_bridge_ids),
+                            "receivedBridgeId": req_bridge_id,
+                        },
+                    )
+                    return
+                request_id = secrets.token_urlsafe(18)
+                now = int(time.time())
+                origin = str(payload.get("origin") or "").strip()
+                requested_caps = payload.get("capabilities") if isinstance(payload.get("capabilities"), list) else []
+                _pair_requests()[request_id] = {
+                    "status": "pending",
+                    "created_at": now,
+                    "expires_at": now + 5 * 60,
+                    "origin": origin,
+                    "requested_caps": [str(c).strip() for c in requested_caps if str(c).strip()],
+                }
+                available_services = compute_available_services(selected_services)
+                release_meta = bridge_release_metadata(bridge_id, selected_services, accepted_bridge_ids)
+                host = str(self.headers.get("Host") or "127.0.0.1:8765").strip()
+                base_url = f"http://{host}"
+                approval_url = f"{base_url}/pair/approve?{urlencode({'requestId': request_id})}"
+                status_url = f"{base_url}/pair/status?{urlencode({'requestId': request_id})}"
+                self._json_response(
+                    202,
+                    {
+                        "ok": True,
+                        "status": "approval_required",
+                        "phase": "pair_start",
+                        "requestId": request_id,
+                        "approvalUrl": approval_url,
+                        "statusUrl": status_url,
+                        "bridgeId": bridge_id,
+                        "acceptedBridgeIds": list(accepted_bridge_ids),
+                        "release": release_meta,
+                        "availableServices": list(available_services),
+                        "detail": "Approve this request in the local Desktop Automation window.",
+                    },
+                )
+                return
+            if self.path == "/pair/approve":
+                request_id = str(payload.get("requestId") or "").strip()
+                decision = str(payload.get("decision") or "").strip().lower()
+                item = _pair_requests().get(request_id)
+                if not request_id or not isinstance(item, dict):
+                    self._json_response(404, {"ok": False, "error": "pair_request_not_found"})
+                    return
+                if decision not in {"approve", "deny"}:
+                    self._json_response(400, {"ok": False, "error": "invalid_decision"})
+                    return
+                if decision == "deny":
+                    item["status"] = "denied"
+                    self._json_response(200, {"ok": True, "status": "denied", "requestId": request_id})
+                    return
+                result = _create_pairing_success(item.get("requested_caps") if isinstance(item.get("requested_caps"), list) else [])
+                item["status"] = "approved"
+                item["result"] = result
+                self._json_response(200, dict(result, status="approved", requestId=request_id))
+                return
             if self.path == "/pair":
                 req_bridge_id = str(payload.get("bridgeId", "") or bridge_id).strip()
                 if req_bridge_id and req_bridge_id not in accepted_bridge_ids:
@@ -874,6 +1105,9 @@ def make_registration_handler(
                 requested_caps = payload.get("capabilities") if isinstance(payload.get("capabilities"), list) else []
                 requested_caps = [str(c).strip() for c in requested_caps if str(c).strip()]
                 cap_to_service = {
+                    "local_fs": "local_fs",
+                    "files": "local_fs",
+                    "file_services": "local_fs",
                     "openclaw": "openclaw_exec",
                     "openclaw_exec": "openclaw_exec",
                     "mcp": "mcp",
@@ -1385,12 +1619,17 @@ def make_registration_handler(
                         last_seen_ts=register_now,
                         auth_headers=merged_headers,
                         show_partial_results=show_partial_results,
+                        next_bridge_poll_ts=0.0,
+                        last_bridge_activity_ts=register_now,
                     )
                 else:
                     q.registered_ts = register_now
                     q.last_seen_ts = register_now
                     q.poll_errors = 0
                     q.auth_headers = merged_headers
+                    q.next_bridge_poll_ts = 0.0
+                    q.last_bridge_activity_ts = register_now
+                    q.bridge_idle_polls = 0
                     if user_id:
                         q.user_id = user_id
                     q.show_partial_results = show_partial_results
@@ -2101,6 +2340,347 @@ def _oc_build_agent_record_from_sources(
     }
 
 
+def normalize_path(raw_path: str) -> Path:
+    # Accept either slash style and normalize to local OS path.
+    path_str = str(raw_path or "").strip().replace("\\", "/")
+    return Path(os.path.normpath(path_str)).expanduser().resolve()
+
+
+
+def resolve_fs_path(raw_path: str, roots: List[Path]) -> Path:
+    # Relative file paths are scoped to the first approved root, not the
+    # bridge process working directory. Absolute paths are validated later.
+    path_str = str(raw_path or "").strip().replace("\\", "/")
+    if not path_str:
+        raise BridgeError("args.path is required")
+    candidate = Path(os.path.normpath(path_str)).expanduser()
+    if not candidate.is_absolute():
+        if not roots:
+            raise BridgeError("No approved file roots are configured")
+        candidate = roots[0] / candidate
+    return candidate.resolve()
+
+def is_within_roots(path: Path, roots: Iterable[Path]) -> bool:
+    for root in roots:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def resolve_candidate_roots(roots: List[Path], roots_hint: object) -> List[Path]:
+    # roots_hint can be a list of names/paths; only allow roots that are in allowlist.
+    if not isinstance(roots_hint, list) or not roots_hint:
+        return roots
+    hinted: List[Path] = []
+    root_by_name = {r.name.lower(): r for r in roots}
+    for raw in roots_hint:
+        val = str(raw or "").strip()
+        if not val:
+            continue
+        # try by terminal folder name first (e.g., "Sentienta")
+        by_name = root_by_name.get(val.lower())
+        if by_name and by_name not in hinted:
+            hinted.append(by_name)
+            continue
+        # try resolving as path and mapping to an allow root parent
+        try:
+            p = Path(val).expanduser().resolve()
+        except Exception:
+            continue
+        for root in roots:
+            try:
+                p.relative_to(root)
+                if root not in hinted:
+                    hinted.append(root)
+            except ValueError:
+                continue
+    return hinted or roots
+
+
+def execute_fs_find_files(
+    call: BridgeCall,
+    roots: List[Path],
+    max_results_default: int,
+    max_results_hard: int,
+) -> Dict[str, object]:
+    # Accept common query aliases from different router prompt variants.
+    query = str(
+        call.args.get("query")
+        or call.args.get("pattern")
+        or call.args.get("filename")
+        or call.args.get("name")
+        or ""
+    ).strip()
+    if not query:
+        raise BridgeError("args.query (or pattern/filename/name) is required")
+
+    max_results = call.args.get("max_results", max_results_default)
+    if not isinstance(max_results, int):
+        try:
+            max_results = int(max_results)
+        except Exception as e:  # noqa: BLE001
+            raise BridgeError("args.max_results must be integer") from e
+    max_results = max(1, min(max_results, max_results_hard))
+
+    # Accept either roots_hint list or single root/base_dir string.
+    roots_hint = call.args.get("roots_hint", [])
+    if not roots_hint:
+        root_one = call.args.get("root") or call.args.get("base_dir")
+        if root_one:
+            roots_hint = [root_one]
+    elif isinstance(roots_hint, str):
+        roots_hint = [roots_hint]
+    candidate_roots = resolve_candidate_roots(roots, roots_hint)
+
+    q = query.lower()
+    patterns: List[str] = []
+    if any(ch in query for ch in ["*", "?", "["]):
+        patterns.append(query)
+    else:
+        patterns.extend([query, f"*{query}*"])
+
+    found: List[Dict[str, object]] = []
+    seen_paths: set[str] = set()
+    for root in candidate_roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        for pattern in patterns:
+            for p in root.rglob(pattern):
+                if len(found) >= max_results:
+                    break
+                try:
+                    rp = p.resolve()
+                except Exception:
+                    continue
+                if not rp.is_file():
+                    continue
+                if not is_within_roots(rp, roots):
+                    continue
+                key = str(rp).lower()
+                if key in seen_paths:
+                    continue
+                seen_paths.add(key)
+                name_lower = rp.name.lower()
+                score = 0.3
+                if name_lower == q:
+                    score = 1.0
+                elif q in name_lower:
+                    score = 0.8
+                found.append(
+                    {
+                        "path": str(rp),
+                        "name": rp.name,
+                        "size_bytes": int(rp.stat().st_size),
+                        "score": score,
+                    }
+                )
+            if len(found) >= max_results:
+                break
+        if len(found) >= max_results:
+            break
+
+    found.sort(key=lambda x: (-float(x.get("score", 0.0)), str(x.get("name", "")).lower()))
+    status = "resolved" if len(found) == 1 else ("needs_selection" if len(found) > 1 else "not_found")
+    return {
+        "query": query,
+        "status": status,
+        "files": found,
+        "count": len(found),
+    }
+
+
+def execute_fs_list_dir(
+    call: BridgeCall,
+    roots: List[Path],
+    max_results_default: int,
+    max_results_hard: int,
+) -> Dict[str, object]:
+    raw_path = str(
+        call.args.get("path")
+        or call.args.get("root")
+        or call.args.get("base_dir")
+        or ""
+    ).strip()
+    if not raw_path:
+        raise BridgeError("args.path (or root/base_dir) is required")
+
+    max_results = call.args.get("max_results", max_results_default)
+    if not isinstance(max_results, int):
+        try:
+            max_results = int(max_results)
+        except Exception as e:  # noqa: BLE001
+            raise BridgeError("args.max_results must be integer") from e
+    max_results = max(1, min(max_results, max_results_hard))
+
+    path = resolve_fs_path(raw_path, roots)
+    if not is_within_roots(path, roots):
+        raise BridgeError(f"Path not allowed: {path}")
+    if not path.exists():
+        raise BridgeError(f"Directory not found: {path}")
+    if not path.is_dir():
+        raise BridgeError(f"Path is not a directory: {path}")
+
+    entries: List[Dict[str, object]] = []
+    children = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    for child in children[:max_results]:
+        try:
+            stat = child.stat()
+            entries.append({
+                "name": child.name,
+                "path": str(child.resolve()),
+                "type": "folder" if child.is_dir() else "file",
+                "size_bytes": None if child.is_dir() else int(stat.st_size),
+                "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+            })
+        except Exception:
+            continue
+
+    return {
+        "path": str(path),
+        "entries": entries,
+        "count": len(entries),
+        "truncated": len(children) > max_results,
+    }
+
+def execute_fs_read_text(call: BridgeCall, roots: List[Path], max_chars_default: int, max_chars_hard: int) -> Dict[str, object]:
+    raw_path = str(call.args.get("path", "")).strip()
+    if not raw_path:
+        raise BridgeError("args.path is required")
+
+    max_chars = call.args.get("max_chars", max_chars_default)
+    if not isinstance(max_chars, int):
+        try:
+            max_chars = int(max_chars)
+        except Exception as e:  # noqa: BLE001
+            raise BridgeError("args.max_chars must be integer") from e
+    max_chars = max(1, min(max_chars, max_chars_hard))
+
+    path = resolve_fs_path(raw_path, roots)
+    if not is_within_roots(path, roots):
+        raise BridgeError(f"Path not allowed: {path}")
+    if not path.exists():
+        raise BridgeError(f"File not found: {path}")
+    if not path.is_file():
+        raise BridgeError(f"Path is not a file: {path}")
+
+    def read_docx_text(docx_path: Path) -> str:
+        try:
+            with zipfile.ZipFile(docx_path, "r") as zf:
+                with zf.open("word/document.xml") as f:
+                    raw = f.read()
+        except Exception as e:  # noqa: BLE001
+            raise BridgeError(f"Failed reading DrCX file: {e}") from e
+        try:
+            root = nT.fromstring(raw)
+        except Exception as e:  # noqa: BLE001
+            raise BridgeError(f"Failed parsing DrCX XML: {e}") from e
+
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        lines: List[str] = []
+        for p in root.findall(".//w:p", ns):
+            parts: List[str] = []
+            for t in p.findall(".//w:t", ns):
+                if t.text:
+                    parts.append(t.text)
+            if parts:
+                lines.append("".join(parts))
+        return "\n".join(lines)
+
+    def read_pdf_text(pdf_path: Path) -> str:
+        # Prefer pypdf/PyPDF2 if installed.
+        reader = None
+        try:
+            from pypdf import PdfReader  # type: ignore
+
+            reader = PdfReader(str(pdf_path))
+        except Exception:
+            try:
+                from PyPDF2 import PdfReader  # type: ignore
+
+                reader = PdfReader(str(pdf_path))
+            except Exception as e:  # noqa: BLE001
+                raise BridgeError(
+                    "PDF parsing requires `pypdf` (or `PyPDF2`) in the bridge environment."
+                ) from e
+
+        pages: List[str] = []
+        for page in getattr(reader, "pages", []):
+            try:
+                txt = page.extract_text() or ""
+            except Exception:
+                txt = ""
+            if txt:
+                pages.append(txt)
+        return "\n\n".join(pages)
+
+    ext = path.suffix.lower()
+    try:
+        if ext == ".docx":
+            text = read_docx_text(path)
+        elif ext == ".pdf":
+            text = read_pdf_text(path)
+        else:
+            text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:  # noqa: BLE001
+        raise BridgeError(f"Failed reading file: {e}") from e
+
+    truncated = len(text) > max_chars
+    content = text[:max_chars]
+    return {
+        "path": str(path),
+        "content": content,
+        "truncated": truncated,
+        "char_count": len(content),
+        "content_type": "document" if ext in {".docx", ".pdf"} else "text",
+        "file_ext": ext,
+    }
+
+
+def execute_fs_write_text(call: BridgeCall, roots: List[Path]) -> Dict[str, object]:
+    raw_path = str(call.args.get("path", "") or "").strip()
+    if not raw_path:
+        raise BridgeError("args.path is required")
+
+    content = call.args.get("content", "")
+    if content is None:
+        content = ""
+    if not isinstance(content, str):
+        content = str(content)
+
+    overwrite = call.args.get("overwrite", True)
+    if isinstance(overwrite, str):
+        overwrite = overwrite.strip().lower() not in {"0", "false", "no"}
+    else:
+        overwrite = bool(overwrite)
+
+    path = resolve_fs_path(raw_path, roots)
+    parent = path.parent.resolve()
+    if not is_within_roots(parent, roots):
+        raise BridgeError(f"Path not allowed: {path}")
+    if path.exists() and path.is_dir():
+        raise BridgeError(f"Path is a directory: {path}")
+    if path.exists() and not overwrite:
+        raise BridgeError(f"File exists and overwrite is false: {path}")
+
+    existed_before = path.exists()
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        raise BridgeError(f"Failed writing file: {e}") from e
+
+    return {
+        "path": str(path),
+        "bytes_written": len(content.encode("utf-8")),
+        "char_count": len(content),
+        "overwrote": bool(existed_before),
+    }
+
+
+
 def execute_openclaw_agents_list(call: BridgeCall, pairing_state: Dict[str, object]) -> Dict[str, object]:
     cfg = pairing_state.get("openclaw_config", {})
     if not isinstance(cfg, dict):
@@ -2330,6 +2910,46 @@ def _oc_resolve_agent_session_jsonl(
         return "", None
 
 
+def _oc_resolve_agent_session_key(
+    pairing_state: Dict[str, object],
+    agent_id: str,
+) -> str:
+    """
+    Resolve the most recently updated canonical gateway session key for an agent.
+    """
+    try:
+        aid = str(agent_id or "").strip()
+        if not aid:
+            return ""
+        agent_dir = _oc_agents_root_from_state(pairing_state) / aid
+        sessions_meta = agent_dir / "sessions" / "sessions.json"
+        if not sessions_meta.exists():
+            return ""
+        obj = try_load_json(sessions_meta.read_text(encoding="utf-8"))
+        if not isinstance(obj, dict):
+            return ""
+        best_key = ""
+        best_updated = -1
+        key_prefix = f"agent:{aid}:"
+        for k, v in obj.items():
+            if not isinstance(v, dict):
+                continue
+            skey = str(k or "").strip()
+            if not skey.startswith(key_prefix):
+                continue
+            upd = int(v.get("updatedAt", 0) or 0)
+            if upd >= best_updated:
+                best_updated = upd
+                best_key = skey
+        return best_key
+    except Exception as e:
+        print("Failed in _oc_resolve_agent_session_key", e)
+        return ""
+def _oc_default_session_key(agent_id: str) -> str:
+    aid = str(agent_id or "").strip()
+    if not aid:
+        return ""
+    return f"agent:{aid}:main"
 def _oc_extract_event_lines_from_jsonl_obj(obj: Dict[str, object]) -> List[Dict[str, str]]:
     """
     Extract concise user-meaningful lines from one JSONL event object.
@@ -2499,8 +3119,11 @@ def _oc_capture_session_jsonl_events(rec: Dict[str, object], pairing_state: Dict
 
         blob = b""
         with open(jsonl_path, "rb") as fh:
+            max_session_read_bytes = 262144
+            if size - pos > max_session_read_bytes:
+                pos = max(0, size - max_session_read_bytes)
             fh.seek(pos)
-            blob = fh.read()
+            blob = fh.read(max_session_read_bytes)
             rec["session_read_pos"] = int(fh.tell())
 
         txt = blob.decode("utf-8", errors="replace")
@@ -2888,6 +3511,54 @@ def _extract_local_media_paths_from_text(text: str) -> List[str]:
     return out
 
 
+def _extract_media_references_from_text(text: str) -> List[str]:
+    src = str(text or "")
+    out: List[str] = []
+    if not src:
+        return out
+    ext_re = "|".join(sorted(MEDIA_EXTENSIONS))
+    media_re = re.compile(rf"\bMnDIA:([^\s\r\n<>\"']+?\.(?:{ext_re}))\b", flags=re.IGNORECASE)
+    for m in media_re.finditer(src):
+        ref = str(m.group(1) or "").strip().rstrip(").,;]")
+        if ref and ref not in out:
+            out.append(ref)
+    return out
+
+
+def _resolve_openclaw_media_reference(ref: str) -> str:
+    raw = str(ref or "").strip()
+    if not raw:
+        return ""
+    if raw.lower().startswith(("http://", "https://", "//", "\\\\")):
+        return ""
+    try:
+        direct = Path(raw).expanduser()
+        if direct.exists() and direct.is_file():
+            return str(direct)
+    except Exception:
+        pass
+
+    # OpenClaw browser/media tools often return only MEDIA:<filename>. Resolve
+    # those tokens back to the local media folder so the bridge can stage a
+    # localhost preview URL for Sentienta.
+    name = Path(raw.replace("\\", "/")).name
+    if not name or name in {".", ".."}:
+        return ""
+    roots = [
+        Path.home() / ".openclaw" / "media" / "browser",
+        Path.home() / ".openclaw" / "media",
+    ]
+    for root in roots:
+        try:
+            candidate = (root / name).resolve()
+            candidate.relative_to(root.resolve())
+            if candidate.exists() and candidate.is_file():
+                return str(candidate)
+        except Exception:
+            continue
+    return ""
+
+
 def _collect_local_media_paths_from_openclaw_payload(payload: Dict[str, object]) -> List[str]:
     out: List[str] = []
     for s in _iter_strings(payload):
@@ -2929,6 +3600,35 @@ def _cleanup_expired_media_tokens(pairing_state: Dict[str, object], max_remove: 
         return removed
     except Exception:
         return 0
+
+
+def _recent_openclaw_browser_media_for_payload(payload: Dict[str, object], max_items: int = 3) -> List[str]:
+    try:
+        last_update_ms = int(payload.get("last_update_ms", 0) or 0) if isinstance(payload, dict) else 0
+        elapsed_ms = int(payload.get("elapsed_ms", 0) or 0) if isinstance(payload, dict) else 0
+        if last_update_ms <= 0 or elapsed_ms <= 0:
+            return []
+        end_ts = last_update_ms / 1000.0
+        start_ts = max(0.0, (last_update_ms - elapsed_ms) / 1000.0 - 10.0)
+        media_root = Path.home() / ".openclaw" / "media" / "browser"
+        if not media_root.exists() or not media_root.is_dir():
+            return []
+        candidates: List[Tuple[float, str]] = []
+        for p in media_root.iterdir():
+            try:
+                if not p.is_file():
+                    continue
+                if p.suffix.lower().lstrip(".") not in MEDIA_EXTENSIONS:
+                    continue
+                mtime = float(p.stat().st_mtime)
+                if start_ts <= mtime <= end_ts + 15.0:
+                    candidates.append((mtime, str(p.resolve())))
+            except Exception:
+                continue
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return [path for _mtime, path in candidates[:max(1, int(max_items or 3))]]
+    except Exception:
+        return []
 
 
 def _stage_local_media_file(path_str: str, pairing_state: Dict[str, object]) -> Optional[Dict[str, object]]:
@@ -3007,9 +3707,15 @@ def _augment_openclaw_result_with_media(payload: Dict[str, object], pairing_stat
         # historical text (tails/events) causes prior/intermediate artifacts to
         # leak into the final payload.
         candidates: List[str] = []
+
+        def add_candidate(ref: object) -> None:
+            resolved = _resolve_openclaw_media_reference(str(ref or ""))
+            if resolved and resolved not in candidates:
+                candidates.append(resolved)
+
         summary_media_path = _extract_summary_media_path(payload.get("summary"))
         if summary_media_path:
-            candidates = [summary_media_path]
+            add_candidate(summary_media_path)
         else:
             nested = payload.get("result")
             if isinstance(nested, dict):
@@ -3024,9 +3730,14 @@ def _augment_openclaw_result_with_media(payload: Dict[str, object], pairing_stat
                             if media_url:
                                 continue
                             txt = str(p.get("text", "") or "").strip()
+                            for ref in _extract_media_references_from_text(txt):
+                                add_candidate(ref)
                             for path in _extract_local_media_paths_from_text(txt):
-                                if path not in candidates:
-                                    candidates.append(path)
+                                add_candidate(path)
+        if not candidates:
+            for path in _recent_openclaw_browser_media_for_payload(payload, max_items=3):
+                if path and path not in candidates:
+                    candidates.append(path)
         if not candidates:
             return payload
         try:
@@ -3187,30 +3898,44 @@ def _oc_join_stream_readers(rec: Dict[str, object], per_thread_timeout: float = 
 
 def _oc_snapshot_tail(rec: Dict[str, object], key: str, n: int = 5) -> List[str]:
     lock = rec.get("stream_lock")
+    acquired = False
     if not hasattr(lock, "acquire") or not hasattr(lock, "release"):
         lock = None
     if lock:
-        lock.acquire()
+        try:
+            acquired = bool(lock.acquire(timeout=0.2))
+        except Typenrror:
+            lock.acquire()
+            acquired = True
+        if not acquired:
+            return []
     try:
         arr = rec.get(key)
         if not isinstance(arr, list):
             return []
         return [str(x or "") for x in arr[-n:]]
     finally:
-        if lock:
+        if lock and acquired:
             lock.release()
 
 
 def _oc_snapshot_full(rec: Dict[str, object], key: str) -> str:
     lock = rec.get("stream_lock")
+    acquired = False
     if not hasattr(lock, "acquire") or not hasattr(lock, "release"):
         lock = None
     if lock:
-        lock.acquire()
+        try:
+            acquired = bool(lock.acquire(timeout=0.2))
+        except Typenrror:
+            lock.acquire()
+            acquired = True
+        if not acquired:
+            return ""
     try:
         return str(rec.get(key, "") or "")
     finally:
-        if lock:
+        if lock and acquired:
             lock.release()
 
 
@@ -3415,6 +4140,174 @@ def _oc_gateway_call(
     return _oc_cli_run(cli_path, subargs, timeout_sec=max(5, int(timeout_ms / 1000) + 10))
 
 
+def _oc_extract_text_parts_from_message_obj(message_obj: object) -> List[str]:
+    out: List[str] = []
+    try:
+        if not isinstance(message_obj, dict):
+            return out
+        content = message_obj.get("content")
+        if not isinstance(content, list):
+            return out
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if str(part.get("type", "") or "").strip().lower() != "text":
+                continue
+            txt = str(part.get("text", "") or "").strip()
+            if txt:
+                out.append(txt)
+    except Exception:
+        return out
+    return out
+def _oc_gateway_fetch_latest_assistant_text(
+    cli_path: str,
+    session_key: str,
+    *,
+    limit: int = 50,
+    timeout_ms: int = 10000,
+    attempts: int = 1,
+    retry_sleep_ms: int = 0,
+) -> List[str]:
+    try:
+        tries = max(1, int(attempts or 1))
+        for attempt in range(1, tries + 1):
+            rc, out, err = _oc_gateway_call(
+                cli_path,
+                "chat.history",
+                {
+                    "sessionKey": str(session_key or "").strip(),
+                    "limit": max(1, min(int(limit or 50), 200)),
+                },
+                timeout_ms=timeout_ms,
+                expect_final=False,
+            )
+            if rc != 0:
+                log(
+                    f"[bridge][oc] chat.history failed rc={rc} attempt={attempt}/{tries} "
+                    f"session_key={session_key} err={str(err or '')[:180]}",
+                    verbose=True,
+                )
+                if attempt < tries and retry_sleep_ms > 0:
+                    time.sleep(max(0, retry_sleep_ms) / 1000.0)
+                continue
+            obj = try_load_json(str(out or "").strip())
+            if not isinstance(obj, dict):
+                log(
+                    f"[bridge][oc] chat.history invalid-json attempt={attempt}/{tries} session_key={session_key}",
+                    verbose=True,
+                )
+                if attempt < tries and retry_sleep_ms > 0:
+                    time.sleep(max(0, retry_sleep_ms) / 1000.0)
+                continue
+            messages = obj.get("messages")
+            if not isinstance(messages, list):
+                log(
+                    f"[bridge][oc] chat.history missing-messages attempt={attempt}/{tries} session_key={session_key}",
+                    verbose=True,
+                )
+                if attempt < tries and retry_sleep_ms > 0:
+                    time.sleep(max(0, retry_sleep_ms) / 1000.0)
+                continue
+            texts: List[str] = []
+            assistant_count = 0
+            for msg in reversed(messages):
+                if not isinstance(msg, dict):
+                    continue
+                role = str(msg.get("role", "") or "").strip().lower()
+                if role != "assistant":
+                    continue
+                assistant_count += 1
+                parts = _oc_extract_text_parts_from_message_obj(msg)
+                if parts:
+                    texts.extend(parts)
+                    break
+            log(
+                f"[bridge][oc] chat.history attempt={attempt}/{tries} session_key={session_key} "
+                f"messages={len(messages)} assistant_messages={assistant_count} text_parts={len(texts)}",
+                verbose=True,
+            )
+            if texts:
+                return texts
+            if attempt < tries and retry_sleep_ms > 0:
+                time.sleep(max(0, retry_sleep_ms) / 1000.0)
+        return []
+    except Exception as e:
+        log(f"[bridge][oc] chat.history exception session_key={session_key} error={e}", verbose=True)
+        return []
+def _oc_gateway_reconcile_session_key(
+    cli_path: str,
+    *,
+    session_key: str = "",
+    agent_id: str = "",
+    timeout_ms: int = 10000,
+) -> str:
+    try:
+        skey = str(session_key or "").strip()
+        aid = str(agent_id or "").strip()
+        candidates: List[Dict[str, object]] = []
+        if skey:
+            candidates.append({"key": skey, "includeUnknown": True, "includeGlobal": True})
+        if aid:
+            candidates.append({"agentId": aid, "includeUnknown": True, "includeGlobal": True})
+        for params in candidates:
+            rc, out, err = _oc_gateway_call(
+                cli_path,
+                "sessions.resolve",
+                params,
+                timeout_ms=timeout_ms,
+                expect_final=False,
+            )
+            if rc != 0:
+                log(
+                    f"[bridge][oc] sessions.resolve failed rc={rc} params={params} err={str(err or '')[:180]}",
+                    verbose=True,
+                )
+                continue
+            obj = try_load_json(str(out or "").strip())
+            if not isinstance(obj, dict):
+                continue
+            resolved = str(obj.get("key", "") or "").strip()
+            if resolved:
+                return resolved
+        if aid:
+            rc, out, err = _oc_gateway_call(
+                cli_path,
+                "sessions.list",
+                {
+                    "limit": 50,
+                    "includeUnknown": True,
+                    "includeGlobal": True,
+                    "agentId": aid,
+                },
+                timeout_ms=timeout_ms,
+                expect_final=False,
+            )
+            if rc != 0:
+                log(
+                    f"[bridge][oc] sessions.list failed rc={rc} agent_id={aid} err={str(err or '')[:180]}",
+                    verbose=True,
+                )
+                return ""
+            obj = try_load_json(str(out or "").strip())
+            if not isinstance(obj, dict):
+                return ""
+            sessions = obj.get("sessions")
+            if not isinstance(sessions, list):
+                return ""
+            best_key = ""
+            best_updated = -1
+            for item in sessions:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("key", "") or item.get("sessionKey", "") or item.get("sessionId", "") or "").strip()
+                updated = int(item.get("updatedAt", 0) or 0)
+                if key and updated >= best_updated:
+                    best_key = key
+                    best_updated = updated
+            return best_key
+    except Exception as e:
+        log(f"[bridge][oc] session reconcile exception agent_id={agent_id} session_key={session_key} error={e}", verbose=True)
+    return ""
 def _extract_agent_ids_from_any(obj: object, out: set) -> None:
     try:
         if isinstance(obj, dict):
@@ -3648,7 +4541,11 @@ def _oc_smoke_test_template_agent(
             timeout_sec=45,
         )
         combined = "\n".join([str(out or ""), str(err or "")]).strip()
-        if rc == 0:
+        smoke_payload_ok = bool(
+            "SENTIENTA_OPENCLAW_TEMPLATE_OK" in combined
+            and re.search(r'"status"\s*:\s*"ok"', combined, flags=re.IGNORECASE)
+        )
+        if rc == 0 or smoke_payload_ok:
             runtime[cache_key] = now
             log(f"[bridge][oc] template smoke passed agent={aid}", verbose=True)
             return
@@ -3693,6 +4590,14 @@ def _oc_ensure_agent_exists(
         aid = str(agent_id or "").strip()
         if not aid:
             raise BridgeError("OpenClaw agent_id is empty")
+
+        execution_mode = str((cfg or {}).get("execution_mode") or "cli").strip().lower()
+        if execution_mode == "gateway_rpc":
+            log(
+                f"[bridge][oc] skipping CLI agent smoke test for gateway_rpc mode agent_id={aid}",
+                verbose=True,
+            )
+            return
 
         cache_ids = runtime.get("known_agent_ids")
         cache_ts = int(runtime.get("known_agent_ids_ts", 0) or 0)
@@ -3774,7 +4679,13 @@ def execute_openclaw_run_task(call: BridgeCall, pairing_state: Dict[str, object]
         or cfg.get("default_agent", "main")
         or "main"
     ).strip() or "main"
-    execution_mode = "cli"
+    execution_mode = str(
+        args.get("execution_mode")
+        or cfg.get("execution_mode", "cli")
+        or "cli"
+    ).strip().lower()
+    if execution_mode not in {"auto", "cli", "gateway_rpc"}:
+        execution_mode = "cli"
     if not (args.get("agent_id") or args.get("agent")):
         log(
             f"[bridge][oc] run_task msg_id={call.msg_id} missing agent_id/agent in args; using default agent={agent_id}",
@@ -3795,24 +4706,68 @@ def execute_openclaw_run_task(call: BridgeCall, pairing_state: Dict[str, object]
     ensure_agent_start = time.perf_counter()
     _oc_ensure_agent_exists(cli_path, runtime, agent_id, cfg=cfg)
     _mark_launch_timing("ensure_agent_ms", ensure_agent_start)
-    session_key = ""
-    run_id = ""
+    session_key = _oc_resolve_agent_session_key(pairing_state, agent_id)
+    requested_gateway_rpc = execution_mode == "gateway_rpc"
+    synthesized_session_key = ""
+    run_id = f"sentienta-{uuid.uuid4().hex}"
     effective_execution_mode = "cli"
     use_json_mode = bool(cfg.get("run_task_json_mode", False))
-    cmd = [
-        cli_path,
-        "agent",
-        "--agent",
-        agent_id,
-        "--message",
-        message,
-        "--verbose",
-        "on",
-        "--timeout",
-        str(timeout_sec),
-    ]
-    if use_json_mode:
-        cmd.append("--json")
+    if not session_key and execution_mode in {"auto", "gateway_rpc"}:
+        # For new/managed agents, prefer the canonical session key instead of
+        # falling straight back to the stale-auth CLI path.
+        synthesized_session_key = _oc_default_session_key(agent_id)
+        session_key = synthesized_session_key
+    should_try_gateway_rpc = execution_mode in {"auto", "gateway_rpc"} and bool(session_key)
+    if should_try_gateway_rpc:
+        effective_execution_mode = "gateway_rpc"
+        cmd = [
+            cli_path,
+            "gateway",
+            "call",
+            "chat.send",
+            "--params",
+            json.dumps(
+                {
+                    "sessionKey": session_key,
+                    "message": message,
+                    "idempotencyKey": run_id,
+                    "timeoutMs": timeout_ms,
+                },
+                ensure_ascii=False,
+            ),
+            "--timeout",
+            str(timeout_ms),
+            "--expect-final",
+            "--json",
+        ]
+        try:
+            log(
+                f"[bridge][oc] rpc session bootstrap agent={agent_id} "
+                f"existing_session={bool(not synthesized_session_key)} "
+                f"synthesized_session_key={synthesized_session_key or '<none>'}",
+                verbose=True,
+            )
+        except Exception:
+            pass
+    else:
+        cmd = [
+            cli_path,
+            "agent",
+            "--agent",
+            agent_id,
+            "--message",
+            message,
+            "--verbose",
+            "on",
+            "--timeout",
+            str(timeout_sec),
+        ]
+        if use_json_mode:
+            cmd.append("--json")
+    if requested_gateway_rpc and effective_execution_mode != "gateway_rpc":
+        raise BridgeError(
+            f'OpenClaw gateway RPC execution requested for agent "{agent_id}" but no existing session key was found.'
+        )
     env = os.environ.copy()
     # Encourage child Python process trees to flush incremental output.
     env["PYTHONUNBUFFERED"] = "1"
@@ -3884,6 +4839,24 @@ def execute_openclaw_run_task(call: BridgeCall, pairing_state: Dict[str, object]
         _mark_launch_timing("session_bind_ms", session_bind_start)
     except Exception as e:
         print("Failed binding session jsonl on run_task", e)
+    if effective_execution_mode == "gateway_rpc":
+        try:
+            resolved_session_key = _oc_gateway_reconcile_session_key(
+                cli_path,
+                session_key=session_key,
+                agent_id=agent_id,
+                timeout_ms=10000,
+            )
+            if resolved_session_key:
+                tasks[task_id]["session_key"] = resolved_session_key
+                session_key = resolved_session_key
+                log(
+                    f"[bridge][oc] reconciled session key task_id={task_id} "
+                    f"agent={agent_id} session_key={resolved_session_key}",
+                    verbose=True,
+                )
+        except Exception as e:
+            log(f"[bridge][oc] session reconcile after launch failed task_id={task_id} error={e}", verbose=True)
     persist_start = time.perf_counter()
     _oc_persist_task_snapshot(pairing_state, tasks[task_id])
     _mark_launch_timing("persist_snapshot_ms", persist_start)
@@ -4273,7 +5246,35 @@ def execute_openclaw_get_status(call: BridgeCall, pairing_state: Dict[str, objec
 
                 assistant_texts = _oc_collect_recent_event_texts(rec, allowed_roles={"assistant"})
                 recent_texts = assistant_texts or _oc_collect_recent_event_texts(rec)
-                if recent_texts:
+                gateway_history_texts: List[str] = []
+                if str(rec.get("execution_mode", "") or "") == "gateway_rpc" and not recent_texts:
+                    try:
+                        cfg = pairing_state.get("openclaw_config", {})
+                        if not isinstance(cfg, dict):
+                            cfg = {}
+                        cli_path = _resolve_openclaw_cli(str(cfg.get("cli_path", "openclaw") or "openclaw"))
+                        gateway_history_texts = _oc_gateway_fetch_latest_assistant_text(
+                            cli_path,
+                            str(rec.get("session_key", "") or "").strip(),
+                            limit=50,
+                            timeout_ms=4000,
+                            attempts=1,
+                            retry_sleep_ms=0,
+                        )
+                    except Exception:
+                        gateway_history_texts = []
+                if str(rec.get("execution_mode", "") or "") == "gateway_rpc" and gateway_history_texts:
+                    for txt in gateway_history_texts:
+                        rec_result = _oc_ensure_payload_text(rec_result, txt)
+                elif str(rec.get("execution_mode", "") or "") == "gateway_rpc" and recent_texts:
+                    for txt in recent_texts:
+                        rec_result = _oc_ensure_payload_text(
+                            rec_result,
+                            txt,
+                            role="assistant" if txt in assistant_texts else "",
+                            source="session",
+                        )
+                elif recent_texts:
                     for txt in recent_texts:
                         rec_result = _oc_ensure_payload_text(
                             rec_result,
@@ -4288,7 +5289,11 @@ def execute_openclaw_get_status(call: BridgeCall, pairing_state: Dict[str, objec
                     rec_result = _oc_ensure_payload_text(rec_result, out_txt, role="assistant", source="stdout")
                 rec["result"] = rec_result
 
-                if recent_texts:
+                if str(rec.get("execution_mode", "") or "") == "gateway_rpc" and gateway_history_texts:
+                    rec["summary"] = str(gateway_history_texts[-1] or "").strip()
+                elif str(rec.get("execution_mode", "") or "") == "gateway_rpc" and recent_texts:
+                    rec["summary"] = str(recent_texts[-1] or "").strip()
+                elif recent_texts:
                     rec["summary"] = str(recent_texts[-1] or "").strip()
                 else:
                     rec["summary"] = str(
@@ -4427,6 +5432,31 @@ def execute_openclaw_cancel_task(call: BridgeCall, pairing_state: Dict[str, obje
             "task_id": task_id,
             "status": str(rec.get("status", "")),
         }
+
+    if str(rec.get("execution_mode", "") or "") == "gateway_rpc":
+        session_key = str(rec.get("session_key", "") or "").strip()
+        run_id = str(rec.get("run_id", "") or "").strip()
+        if session_key:
+            try:
+                cli_path = _resolve_openclaw_cli(str(cfg.get("cli_path", "openclaw") or "openclaw"))
+                abort_params: Dict[str, object] = {"sessionKey": session_key}
+                if run_id:
+                    abort_params["runId"] = run_id
+                rc, out, err = _oc_gateway_call(
+                    cli_path,
+                    "chat.abort",
+                    abort_params,
+                    timeout_ms=10000,
+                    expect_final=False,
+                )
+                log(
+                    f"[bridge][oc] cancel gateway_rpc task_id={task_id} rc={rc} "
+                    f"session_key={session_key} run_id={run_id or '<none>'} "
+                    f"err={str(err or '')[:140]}",
+                    verbose=True,
+                )
+            except Exception as e:
+                log(f"[bridge][oc] cancel gateway_rpc task_id={task_id} error={e}", verbose=True)
 
     proc = rec.get("process")
     if proc is not None:
@@ -5155,6 +6185,279 @@ def _execute_approved_github_issue_create(record: Dict[str, object], pairing_sta
     }
 
 
+def _google_calendar_config(pairing_state: Dict[str, object]) -> Dict[str, str]:
+    cfg = pairing_state.get("google_calendar_config") if isinstance(pairing_state.get("google_calendar_config"), dict) else {}
+    return {
+        "access_token": str(cfg.get("access_token") or "").strip(),
+        "refresh_token": str(cfg.get("refresh_token") or "").strip(),
+        "client_id": str(cfg.get("client_id") or "").strip(),
+        "client_secret": str(cfg.get("client_secret") or "").strip(),
+        "calendar_id": str(cfg.get("calendar_id") or "primary").strip() or "primary",
+        "timezone": str(cfg.get("timezone") or "America/New_York").strip() or "America/New_York",
+    }
+
+
+def _google_calendar_refresh_access_token(pairing_state: Dict[str, object]) -> str:
+    cfg = _google_calendar_config(pairing_state)
+    if not cfg.get("refresh_token") or not cfg.get("client_id") or not cfg.get("client_secret"):
+        return cfg.get("access_token") or ""
+    payload = urlencode({
+        "client_id": cfg["client_id"],
+        "client_secret": cfg["client_secret"],
+        "refresh_token": cfg["refresh_token"],
+        "grant_type": "refresh_token",
+    }).encode("utf-8")
+    req = Request(
+        "https://oauth2.googleapis.com/token",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:500]
+        raise BridgeError(f"google_calendar_oauth_http_{e.code}: {detail}") from e
+    except URLError as e:
+        raise BridgeError(f"google_calendar_oauth_network_error: {e}") from e
+    try:
+        obj = json.loads(raw)
+    except Exception as e:
+        raise BridgeError(f"google_calendar_oauth_invalid_json: {raw[:300]}") from e
+    token = str((obj or {}).get("access_token") or "").strip()
+    if not token:
+        raise BridgeError(f"google_calendar_oauth_no_access_token: {raw[:300]}")
+    state_cfg = pairing_state.setdefault("google_calendar_config", {})
+    if isinstance(state_cfg, dict):
+        state_cfg["access_token"] = token
+        try:
+            expires_in = int((obj or {}).get("expires_in") or 3600)
+        except Exception:
+            expires_in = 3600
+        state_cfg["access_token_expires_at"] = int(time.time()) + max(60, expires_in - 60)
+    return token
+
+
+def _google_calendar_access_token(pairing_state: Dict[str, object]) -> str:
+    cfg_raw = pairing_state.get("google_calendar_config") if isinstance(pairing_state.get("google_calendar_config"), dict) else {}
+    token = str(cfg_raw.get("access_token") or "").strip()
+    try:
+        expires_at = int(cfg_raw.get("access_token_expires_at") or 0)
+    except Exception:
+        expires_at = 0
+    if token and (not expires_at or int(time.time()) < expires_at):
+        return token
+    refreshed = _google_calendar_refresh_access_token(pairing_state)
+    if refreshed:
+        return refreshed
+    raise BridgeError("google_calendar_token_not_configured")
+
+
+def _google_calendar_api_request(
+    method: str,
+    path: str,
+    pairing_state: Dict[str, object],
+    params: Optional[Dict[str, object]] = None,
+    payload: Optional[Dict[str, object]] = None,
+) -> object:
+    token = _google_calendar_access_token(pairing_state)
+    path_txt = str(path or "").strip()
+    if not path_txt.startswith("/"):
+        path_txt = f"/{path_txt}"
+    url = f"https://www.googleapis.com/calendar/v3{path_txt}"
+    if params:
+        query = urlencode({k: v for k, v in (params or {}).items() if v not in (None, "")})
+        if query:
+            url = f"{url}?{query}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    data = None
+    if payload is not None:
+        data = json.dumps(payload or {}).encode("utf-8")
+        headers["Content-Type"] = "application/json; charset=utf-8"
+    req = Request(url, data=data, headers=headers, method=str(method or "GET").upper())
+    try:
+        with urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:500]
+        raise BridgeError(f"google_calendar_http_{e.code}: {detail}") from e
+    except URLError as e:
+        raise BridgeError(f"google_calendar_network_error: {e}") from e
+    if not raw.strip():
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        raise BridgeError(f"google_calendar_invalid_json: {raw[:300]}") from e
+
+
+def _google_calendar_local_day_bounds(day_text: str, timezone_name: str) -> Tuple[str, str, str]:
+    tz_name = str(timezone_name or "America/New_York").strip() or "America/New_York"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = datetime.now().astimezone().tzinfo or timezone.utc
+        tz_name = str(timezone_name or "local")
+    raw_day = str(day_text or "").strip().lower()
+    now_local = datetime.now(tz)
+    if raw_day in {"", "today", "current day"}:
+        date_obj = now_local.date()
+    elif raw_day == "tomorrow":
+        date_obj = (now_local + timedelta(days=1)).date()
+    else:
+        try:
+            date_obj = datetime.fromisoformat(raw_day.replace("Z", "+00:00")).astimezone(tz).date()
+        except Exception:
+            try:
+                date_obj = datetime.strptime(raw_day[:10], "%Y-%m-%d").date()
+            except Exception:
+                date_obj = now_local.date()
+    start = datetime.combine(date_obj, datetime.min.time(), tzinfo=tz)
+    end = start + timedelta(days=1)
+    return start.isoformat(), end.isoformat(), str(date_obj)
+
+
+def normalize_google_calendar_args(provider_tool: str, args: Dict[str, object], pairing_state: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+    raw = dict(args or {})
+    cfg = _google_calendar_config(pairing_state or {})
+    normalized = dict(raw)
+    normalized["calendar_id"] = str(raw.get("calendar_id") or raw.get("calendarId") or raw.get("calendar") or cfg.get("calendar_id") or "primary").strip() or "primary"
+    normalized["timezone"] = str(raw.get("timezone") or raw.get("timeZone") or cfg.get("timezone") or "America/New_York").strip() or "America/New_York"
+    if provider_tool == "events.list":
+        if not str(raw.get("time_min") or raw.get("timeMin") or "").strip() or not str(raw.get("time_max") or raw.get("timeMax") or "").strip():
+            start, end, day = _google_calendar_local_day_bounds(str(raw.get("date") or raw.get("day") or "today"), normalized["timezone"])
+            normalized.setdefault("time_min", start)
+            normalized.setdefault("time_max", end)
+            normalized.setdefault("date", day)
+        else:
+            normalized["time_min"] = str(raw.get("time_min") or raw.get("timeMin") or "").strip()
+            normalized["time_max"] = str(raw.get("time_max") or raw.get("timeMax") or "").strip()
+        try:
+            normalized["max_results"] = max(1, min(int(raw.get("max_results") or raw.get("maxResults") or raw.get("limit") or 20), 100))
+        except Exception:
+            normalized["max_results"] = 20
+    if provider_tool == "events.create":
+        title = str(raw.get("summary") or raw.get("title") or raw.get("name") or "").strip()
+        description = str(raw.get("description") or raw.get("details") or raw.get("notes") or "").strip()
+        normalized["summary"] = title[:1024]
+        if description:
+            normalized["description"] = description[:8000]
+        start_value = str(raw.get("start") or raw.get("start_time") or raw.get("startTime") or raw.get("dueAt") or raw.get("dateTime") or "").strip()
+        end_value = str(raw.get("end") or raw.get("end_time") or raw.get("endTime") or "").strip()
+        if start_value:
+            normalized["start"] = start_value
+        if end_value:
+            normalized["end"] = end_value
+        try:
+            duration = int(raw.get("duration_minutes") or raw.get("durationMinutes") or 30)
+        except Exception:
+            duration = 30
+        normalized["duration_minutes"] = max(1, min(duration, 1440))
+    return normalized
+
+
+def execute_google_calendar_events_list(call: BridgeCall, pairing_state: Dict[str, object]) -> Dict[str, object]:
+    args = normalize_google_calendar_args("events.list", call.args if isinstance(call.args, dict) else {}, pairing_state)
+    calendar_id = str(args.get("calendar_id") or "primary").strip() or "primary"
+    params = {
+        "timeMin": str(args.get("time_min") or ""),
+        "timeMax": str(args.get("time_max") or ""),
+        "singlenvents": "true",
+        "orderBy": "startTime",
+        "maxResults": str(int(args.get("max_results") or 20)),
+    }
+    obj = _google_calendar_api_request("GET", f"/calendars/{quote(calendar_id, safe='')}/events", pairing_state, params=params)
+    if not isinstance(obj, dict):
+        raise BridgeError("google_calendar_unexpected_events_response")
+    events = []
+    for item in obj.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        start = item.get("start") if isinstance(item.get("start"), dict) else {}
+        end = item.get("end") if isinstance(item.get("end"), dict) else {}
+        events.append({
+            "id": str(item.get("id") or ""),
+            "summary": str(item.get("summary") or ""),
+            "description": str(item.get("description") or ""),
+            "start": str(start.get("dateTime") or start.get("date") or ""),
+            "end": str(end.get("dateTime") or end.get("date") or ""),
+            "html_link": str(item.get("htmlLink") or ""),
+            "status": str(item.get("status") or ""),
+        })
+    return {
+        "provider": "google_calendar",
+        "tool": "events.list",
+        "status": "completed",
+        "service_family": MCP_PREVIEW_SERVICE,
+        "phase": "phase_6_read_only",
+        "calendar_id": calendar_id,
+        "time_min": str(args.get("time_min") or ""),
+        "time_max": str(args.get("time_max") or ""),
+        "date": str(args.get("date") or ""),
+        "events": events,
+    }
+
+
+def _google_calendar_event_time(value: str, timezone_name: str) -> Dict[str, str]:
+    txt = str(value or "").strip()
+    if not txt:
+        return {}
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", txt):
+        return {"date": txt}
+    return {"dateTime": txt, "timeZone": timezone_name}
+
+
+def _execute_approved_google_calendar_event_create(record: Dict[str, object], pairing_state: Dict[str, object]) -> Dict[str, object]:
+    proposed = record.get("proposed_action") if isinstance(record.get("proposed_action"), dict) else {}
+    args = normalize_google_calendar_args("events.create", proposed.get("args") if isinstance(proposed.get("args"), dict) else {}, pairing_state)
+    calendar_id = str(args.get("calendar_id") or "primary").strip() or "primary"
+    timezone_name = str(args.get("timezone") or "America/New_York").strip() or "America/New_York"
+    summary = str(args.get("summary") or "").strip()
+    start_value = str(args.get("start") or "").strip()
+    end_value = str(args.get("end") or "").strip()
+    if not summary:
+        raise BridgeError("google_calendar_event_summary_required")
+    if not start_value:
+        raise BridgeError("google_calendar_event_start_required")
+    if not end_value:
+        try:
+            parsed = datetime.fromisoformat(start_value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=ZoneInfo(timezone_name))
+            end_value = (parsed + timedelta(minutes=int(args.get("duration_minutes") or 30))).isoformat()
+        except Exception:
+            raise BridgeError("google_calendar_event_end_required")
+    payload = {
+        "summary": summary,
+        "start": _google_calendar_event_time(start_value, timezone_name),
+        "end": _google_calendar_event_time(end_value, timezone_name),
+    }
+    description = str(args.get("description") or "").strip()
+    if description:
+        payload["description"] = description
+    location = str(args.get("location") or "").strip()
+    if location:
+        payload["location"] = location
+    obj = _google_calendar_api_request("POST", f"/calendars/{quote(calendar_id, safe='')}/events", pairing_state, payload=payload)
+    if not isinstance(obj, dict) or not obj.get("id"):
+        raise BridgeError("google_calendar_unexpected_event_create_response")
+    return {
+        "provider": "google_calendar",
+        "tool": "events.create",
+        "calendar_id": calendar_id,
+        "id": str(obj.get("id") or ""),
+        "summary": str(obj.get("summary") or summary),
+        "html_link": str(obj.get("htmlLink") or ""),
+        "start": obj.get("start") if isinstance(obj.get("start"), dict) else {},
+        "end": obj.get("end") if isinstance(obj.get("end"), dict) else {},
+        "status": str(obj.get("status") or ""),
+    }
+
+
 def execute_approved_mcp_action(record: Dict[str, object], pairing_state: Dict[str, object]) -> Dict[str, object]:
     proposed = record.get("proposed_action") if isinstance(record.get("proposed_action"), dict) else {}
     provider = str(proposed.get("provider") or "").strip().lower()
@@ -5163,6 +6466,8 @@ def execute_approved_mcp_action(record: Dict[str, object], pairing_state: Dict[s
         return _execute_approved_slack_message(record, pairing_state)
     if provider == "github" and tool == "issues.create":
         return _execute_approved_github_issue_create(record, pairing_state)
+    if provider == "google_calendar" and tool == "events.create":
+        return _execute_approved_google_calendar_event_create(record, pairing_state)
     if provider == "zapier" and tool in {"actions.run", "actions.execute_write"}:
         return _execute_approved_zapier_action_run(record, pairing_state)
     raise BridgeError("executor_not_configured_for_tool")
@@ -5870,6 +7175,8 @@ def normalize_mcp_action_args(provider: str, provider_tool: str, args: object) -
         return normalize_github_args(provider_tool, arg_obj)
     if provider == "zapier":
         return normalize_zapier_args(provider_tool, arg_obj)
+    if provider == "google_calendar":
+        return normalize_google_calendar_args(provider_tool, arg_obj, None)
     return dict(arg_obj)
 
 
@@ -6186,6 +7493,20 @@ def execute_mcp_call(call: BridgeCall, pairing_state: Dict[str, object]) -> Dict
         }
         audit_mcp_event(pairing_state, envelope, policy, result_status="success")
         return result
+    if server_key == "google_calendar" and provider_tool == "events.list":
+        events = execute_google_calendar_events_list(call, pairing_state)
+        result = {
+            **events,
+            "tool": call.tool,
+            "status": "completed",
+            "service_family": MCP_PREVIEW_SERVICE,
+            "phase": "phase_6_read_only",
+            "server": public_cfg,
+            "policy": policy,
+            "audit": {"shape": "mcp-governance-v1"},
+        }
+        audit_mcp_event(pairing_state, envelope, policy, result_status="success")
+        return result
     if server_key == "github" and provider_tool == "repositories.get":
         repo = execute_github_repository_get(call, pairing_state)
         result = {
@@ -6255,6 +7576,39 @@ def execute_call(
     max_find_results_default: int,
     max_find_results_hard: int,
 ) -> Dict[str, object]:
+    if call.tool == "fs.find_files":
+        if "local_fs" not in selected_services:
+            raise BridgeError("Service disabled: local_fs")
+        result = execute_fs_find_files(call, roots, max_find_results_default, max_find_results_hard)
+        result["file_status"] = result.get("status", "")
+        result["status"] = "completed"
+        result["tool"] = call.tool
+        result["service_family"] = "local_fs"
+        return result
+    if call.tool == "fs.list_dir":
+        if "local_fs" not in selected_services:
+            raise BridgeError("Service disabled: local_fs")
+        result = execute_fs_list_dir(call, roots, max_find_results_default, max_find_results_hard)
+        result["status"] = "completed"
+        result["tool"] = call.tool
+        result["service_family"] = "local_fs"
+        return result
+    if call.tool == "fs.read_text":
+        if "local_fs" not in selected_services:
+            raise BridgeError("Service disabled: local_fs")
+        result = execute_fs_read_text(call, roots, max_chars_default, max_chars_hard)
+        result["status"] = "completed"
+        result["tool"] = call.tool
+        result["service_family"] = "local_fs"
+        return result
+    if call.tool == "fs.write_text":
+        if "local_fs" not in selected_services:
+            raise BridgeError("Service disabled: local_fs")
+        result = execute_fs_write_text(call, roots)
+        result["status"] = "completed"
+        result["tool"] = call.tool
+        result["service_family"] = "local_fs"
+        return result
     if call.tool == "openclaw.run_task":
         if "openclaw_exec" not in selected_services:
             raise BridgeError("Service disabled: openclaw_exec")
@@ -6493,8 +7847,18 @@ def post_mcp_approval_decision_governance_event(
 
 def main() -> int:
     args = parse_args()
-    roots: List[Path] = []
+    roots: List[Path] = [Path(r).expanduser().resolve() for r in getattr(args, "allow_root", [])]
     selected_services = resolve_selected_services(args.service, args.bridge_id)
+    if MCP_PREVIEW_SERVICE in selected_services:
+        print(
+            "ERROR: MCP is not available in the standard Personal Device bridge. "
+            "Run sentienta_bridge_enterprise.py in Enterprise Services Bridge mode to enable MCP services.",
+            file=sys.stderr,
+        )
+        return 2
+    if "local_fs" in selected_services and not roots:
+        print("ERROR: at least one --allow-root is required when local_fs is enabled", file=sys.stderr)
+        return 2
     accepted_bridge_ids = resolve_accepted_bridge_ids(args.bridge_id, selected_services)
     if args.service:
         requested = []
@@ -6544,7 +7908,7 @@ def main() -> int:
             "cli_path": str(args.openclaw_cli or "openclaw").strip() or "openclaw",
             "default_agent": str(args.openclaw_default_agent or "main").strip() or "main",
             "default_timeout_ms": int(args.openclaw_default_timeout_ms or 210000),
-            "execution_mode": "cli",
+            "execution_mode": str(args.openclaw_execution_mode or "cli").strip().lower() or "cli",
             "agents_root": str((Path.home() / ".openclaw" / "agents").resolve()),
         },
         "openclaw_runtime": {
@@ -6577,6 +7941,7 @@ def main() -> int:
             registered_ts=seed_now,
             last_seen_ts=seed_now,
             auth_headers=headers if has_auth_credential(headers) else None,
+            last_bridge_activity_ts=seed_now,
         )
         active_queries[(seed.team_name, seed.query_id)] = seed
 
@@ -6619,9 +7984,13 @@ def main() -> int:
                     key=lambda q: (float(q.registered_ts or 0.0), float(q.last_seen_ts or 0.0)),
                     reverse=True,
                 )
-            loop_sleep = max(0.1, args.poll_ms / 1000.0)
+            loop_sleep = BRIDGE_PrLL_FAST_SnCS if snapshot else BRIDGE_PrLL_IDLn_SnCS
 
             for q in snapshot:
+                now_for_poll = time.time()
+                if q.next_bridge_poll_ts and q.next_bridge_poll_ts > now_for_poll:
+                    loop_sleep = min(loop_sleep, max(0.1, q.next_bridge_poll_ts - now_for_poll))
+                    continue
                 poll_headers = q.auth_headers if has_auth_credential(q.auth_headers) else headers
                 if not has_auth_credential(poll_headers):
                     record_bridge_debug_event(
@@ -6631,6 +8000,8 @@ def main() -> int:
                         query_id=q.query_id,
                         user_id=q.user_id,
                     )
+                    q.next_bridge_poll_ts = time.time() + BRIDGE_PrLL_IDLn_SnCS
+                    loop_sleep = min(loop_sleep, BRIDGE_PrLL_IDLn_SnCS)
                     continue
                 bridge_calls: List[BridgeCall] = []
                 try:
@@ -6758,6 +8129,9 @@ def main() -> int:
                         },
                     )
                     log(f"[bridge] poll error team={q.team_name} query={q.query_id}: {e}", verbose=True)
+                    error_delay = min(BRIDGE_PrLL_MAX_SnCS, BRIDGE_PrLL_WARM_SnCS * max(1, q.poll_errors))
+                    q.next_bridge_poll_ts = time.time() + error_delay
+                    loop_sleep = min(loop_sleep, error_delay)
                     if q.poll_errors >= 5:
                         with active_lock:
                             active_queries.pop((q.team_name, q.query_id), None)
@@ -6806,6 +8180,14 @@ def main() -> int:
                 # Always keep legacy parser as a fallback until outbox delivery is fully reliable.
                 calls = list(bridge_calls)
                 calls.extend(extract_bridge_calls(body))
+                had_bridge_activity = bool(outbox_messages) or bool(calls)
+                next_delay = bridge_poll_delay_for_query(
+                    q,
+                    had_activity=had_bridge_activity,
+                    had_pending=bool(mcp_any_pending),
+                )
+                q.next_bridge_poll_ts = time.time() + next_delay
+                loop_sleep = min(loop_sleep, next_delay)
                 if bridge_calls:
                     q.mcp_handled_count += len(bridge_calls)
                     q.mcp_empty_polls_after_handled = 0
@@ -7051,9 +8433,10 @@ def main() -> int:
                                 log("[bridge] no active queries remain, exiting.", verbose=True)
                                 return 0
                 elif q.openclaw_terminal_ts > 0.0:
-                    # Do not retire solely on terminal OpenClaw status.
-                    # The server may still need to post final dialog content and EOD.
-                    pass
+                    if q.mcp_empty_polls_after_handled >= 3 or (time.time() - q.openclaw_terminal_ts) >= 30.0:
+                        with active_lock:
+                            active_queries.pop((q.team_name, q.query_id), None)
+                        log(f"[bridge] retired terminal OpenClaw query team={q.team_name} query={q.query_id}", verbose=True)
                 elif (
                     not args.enable_legacy_dialog_calls
                     and q.mcp_handled_count > 0
@@ -7073,3 +8456,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
