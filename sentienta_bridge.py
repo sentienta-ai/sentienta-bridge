@@ -634,6 +634,15 @@ def compute_available_services(selected_services: List[str]) -> List[str]:
     return services
 
 
+
+def format_available_service_names(selected_services: List[str]) -> str:
+    labels = {
+        "local_fs": "Local File Services",
+        "openclaw_exec": "OpenClaw",
+        MCP_PREVIEW_SERVICE: "MCP Services",
+    }
+    return ", ".join(labels.get(service, service) for service in compute_available_services(selected_services))
+
 def append_query_param(url: str, key: str, value: str) -> str:
     try:
         parsed = urlparse(url)
@@ -916,14 +925,14 @@ def make_registration_handler(
                     body = "<html><body><h2>Request not found</h2><p>This Desktop Automation request expired or was already completed.</p></body></html>"
                 else:
                     origin = html.escape(str(item.get("origin") or "Sentienta"), quote=True)
-                    services = ", ".join(compute_available_services(selected_services)) or "Desktop Automation"
+                    services = format_available_service_names(selected_services) or "Desktop Automation"
                     body = f"""
 <!doctype html>
 <html><head><meta charset='utf-8'><title>Approve Sentienta Desktop Automation</title>
 <style>body{{font-family:Arial,sans-serif;margin:32px;color:#102a43;line-height:1.45}}button{{min-height:40px;padding:0 16px;margin-right:8px;border-radius:8px;border:1px solid #b8c7d3;font-weight:700;cursor:pointer}}button.approve{{background:#0798c1;color:white;border-color:#0798c1}}#status{{margin-top:16px;font-weight:700}}</style></head>
 <body>
 <h2>Approve Sentienta Desktop Automation?</h2>
-<p>Allow <strong>{origin}</strong> to connect this browser to the local Sentienta bridge on this computer.</p>
+<p>Allow <strong>{origin}</strong> to connect this browser to the local Sentienta Bridge on this computer.</p>
 <p>Available local services: <strong>{html.escape(services)}</strong></p>
 <button class='approve' onclick="decide('approve')">Approve</button>
 <button onclick="decide('deny')">Deny</button>
@@ -935,7 +944,7 @@ async function decide(decision) {{
   try {{
     const resp = await fetch('/pair/approve', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{requestId:{json.dumps(request_id)}, decision}})}});
     const data = await resp.json();
-    if (!resp.ok || data.ok !== true) throw new nrror(data.error || 'Request failed');
+    if (!resp.ok || data.ok !== true) throw new Error(data.error || 'Request failed');
     status.textContent = decision === 'approve' ? 'Approved. You can close this window.' : 'Denied. You can close this window.';
     setTimeout(() => window.close(), 900);
   }} catch (error) {{
