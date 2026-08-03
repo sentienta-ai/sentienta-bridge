@@ -1024,6 +1024,13 @@ async function decide(decision) {{
                 ]
             available_services = compute_available_services(selected_services)
             release_meta = bridge_release_metadata(bridge_id, selected_services, accepted_bridge_ids)
+            health_now = int(time.time())
+            health_secret = str(pairing_state.get("bridge_secret") or "").strip()
+            health_expires_at = int(pairing_state.get("bridge_secret_expires_at", 0) or 0)
+            health_paired = bool(health_secret and (not health_expires_at or health_now < health_expires_at))
+            if not health_paired:
+                pairing_state["paired_principal"] = ""
+                pairing_state["paired_account_label"] = ""
             self._json_response(
                 200,
                 {
@@ -1032,8 +1039,9 @@ async function decide(decision) {{
                     "acceptedBridgeIds": list(accepted_bridge_ids),
                     "release": release_meta,
                     "activeQueries": items,
-                    "paired": bool(pairing_state.get("bridge_secret")),
-                    "bridgeSecretExpiresAt": int(pairing_state.get("bridge_secret_expires_at", 0) or 0),
+                    "paired": health_paired,
+                    "pairedAccount": str(pairing_state.get("paired_account_label") or "").strip() if health_paired else "",
+                    "bridgeSecretExpiresAt": health_expires_at,
                     "availableServices": list(available_services),
                 },
             )
