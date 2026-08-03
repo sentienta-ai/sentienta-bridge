@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Sentienta desktop bridge v2.
 
@@ -240,6 +240,7 @@ def main() -> int:
         active_queries=active_queries,
         lock=active_lock,
         default_auth_headers=headers,
+        query_endpoint=args.query_endpoint,
         pairing_state=pairing_state,
         roots=roots,
         selected_services=selected_services,
@@ -679,3 +680,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
