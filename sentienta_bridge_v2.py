@@ -155,6 +155,10 @@ def _refresh_local_openclaw_inventory(
 def main() -> int:
     args = bridge.parse_args()
     roots: List[Path] = []
+    for raw_root in args.allow_root or []:
+        root = Path(str(raw_root or "").strip()).expanduser().resolve()
+        if root not in roots:
+            roots.append(root)
     selected_services = bridge.resolve_selected_services(args.service, args.bridge_id)
     accepted_bridge_ids = bridge.resolve_accepted_bridge_ids(args.bridge_id, selected_services)
     if args.service:

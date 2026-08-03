@@ -2523,7 +2523,9 @@ def execute_fs_list_dir(
         or ""
     ).strip()
     if not raw_path:
-        raise BridgeError("args.path (or root/base_dir) is required")
+        if not roots:
+            raise BridgeError("No approved Local File Services root is configured")
+        raw_path = str(roots[0])
 
     max_results = call.args.get("max_results", max_results_default)
     if not isinstance(max_results, int):

@@ -1,4 +1,10 @@
-# Sentienta Bridge Release Notes
+﻿# Sentienta Bridge Release Notes
+
+## August 3, 2026 - Simpler Local File Services Startup
+
+- The Windows launcher now starts the recommended personal bridge with Local File Services and OpenClaw enabled.
+- The bridge directory is approved as the default Local File Services root, so ordinary listing requests do not need to name a path.
+- A caller may still provide an explicit path, but it must remain within an approved root.
 
 ## August 3, 2026 - Stable Multi-Tab Pairing
 
@@ -56,3 +62,4 @@ Replace all three Python files together, restart the bridge, then verify:
 3. A read-only request completes.
 4. The result returns to the correct personal conversation or Workroom.
 5. Enterprise membership rules prevent unauthorized use of organization-controlled agents.
+
