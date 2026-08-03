@@ -2540,8 +2540,19 @@ def execute_fs_list_dir(
     if not path.is_dir():
         raise BridgeError(f"Path is not a directory: {path}")
 
+    include_files = bool(call.args.get("include_files", True))
+    include_folders = bool(call.args.get("include_folders", True))
+    if not include_files and not include_folders:
+        raise BridgeError("At least one of args.include_files or args.include_folders must be true")
+
     entries: List[Dict[str, object]] = []
-    children = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    children = sorted(
+        (
+            child for child in path.iterdir()
+            if (child.is_dir() and include_folders) or (child.is_file() and include_files)
+        ),
+        key=lambda p: (not p.is_dir(), p.name.lower()),
+    )
     page_children = children[offset:offset + max_results]
     for child in page_children:
         try:

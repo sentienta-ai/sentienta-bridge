@@ -1,5 +1,10 @@
 # Sentienta Bridge Release Notes
 
+## August 3, 2026 - Files-Only Directory Listings
+
+- Local File Services directory calls can now request files only, folders only, or both.
+- Filtering occurs before pagination so totals and continuation offsets match the requested item type.
+
 ## August 3, 2026 - Local File Services Result Continuation
 
 - Directory listings now return total-count, offset, next-page, and remaining-count metadata.
