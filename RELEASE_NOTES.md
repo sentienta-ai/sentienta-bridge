@@ -1,5 +1,11 @@
 # Sentienta Bridge Release Notes
 
+## August 3, 2026 - Stable Multi-Tab Pairing
+
+- Pairing another Sentienta browser tab now reuses the active unexpired bridge authorization.
+- A second successful pairing no longer disconnects a tab that was already using the bridge.
+- Expired authorizations are still replaced normally.
+
 ## August 3, 2026 - Files-Only Directory Listings
 
 - Local File Services directory calls can now request files only, folders only, or both.

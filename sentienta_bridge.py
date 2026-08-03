@@ -677,6 +677,23 @@ def run_auth_probe(
         raise
 
 
+def get_or_create_active_bridge_secret(
+    pairing_state: Dict[str, object],
+    now: Optional[int] = None,
+) -> Tuple[str, int]:
+    current_time = int(time.time()) if now is None else int(now)
+    bridge_secret = str(pairing_state.get("bridge_secret", "") or "").strip()
+    secret_expires_at = int(pairing_state.get("bridge_secret_expires_at", 0) or 0)
+    if bridge_secret and secret_expires_at and current_time < secret_expires_at:
+        return bridge_secret, secret_expires_at
+    bridge_secret = secrets.token_urlsafe(24)
+    secret_expires_at = current_time + 8 * 60 * 60
+    pairing_state["bridge_secret"] = bridge_secret
+    pairing_state["bridge_secret_expires_at"] = secret_expires_at
+    pairing_state["paired_at"] = current_time
+    return bridge_secret, secret_expires_at
+
+
 def make_registration_handler(
     bridge_id: str,
     active_queries: Dict[Tuple[str, str], ActiveQuery],
@@ -714,11 +731,7 @@ def make_registration_handler(
             enabled_bridge_ids.append(bridge_id)
 
         now = int(time.time())
-        bridge_secret = secrets.token_urlsafe(24)
-        secret_expires_at = now + 8 * 60 * 60
-        pairing_state["bridge_secret"] = bridge_secret
-        pairing_state["bridge_secret_expires_at"] = secret_expires_at
-        pairing_state["paired_at"] = now
+        bridge_secret, secret_expires_at = get_or_create_active_bridge_secret(pairing_state, now)
         pairing_state["pair_failures"] = []
 
         available_services = compute_available_services(selected_services)
@@ -1132,11 +1145,7 @@ async function decide(decision) {{
                 if bridge_id not in enabled_bridge_ids:
                     enabled_bridge_ids.append(bridge_id)
 
-                bridge_secret = secrets.token_urlsafe(24)
-                secret_expires_at = now + 8 * 60 * 60
-                pairing_state["bridge_secret"] = bridge_secret
-                pairing_state["bridge_secret_expires_at"] = secret_expires_at
-                pairing_state["paired_at"] = now
+                bridge_secret, secret_expires_at = get_or_create_active_bridge_secret(pairing_state, now)
                 pairing_state["pair_failures"] = []
 
                 available_services = compute_available_services(selected_services)
