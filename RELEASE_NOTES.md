@@ -1,4 +1,4 @@
-﻿# Sentienta Bridge Release Notes
+# Sentienta Bridge Release Notes
 
 ## August 3, 2026 - Simpler Local File Services Startup
 
@@ -10,6 +10,7 @@
 
 - Pairing another Sentienta browser tab now reuses the active unexpired bridge authorization.
 - A second successful pairing no longer disconnects a tab that was already using the bridge.
+- A running personal bridge now rejects pairing from a different Sentienta account and reports which account is already connected.
 - Expired authorizations are still replaced normally.
 
 ## August 3, 2026 - Files-Only Directory Listings

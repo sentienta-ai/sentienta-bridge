@@ -694,6 +694,37 @@ def get_or_create_active_bridge_secret(
     return bridge_secret, secret_expires_at
 
 
+def pairing_identity_hint(id_token: str) -> Tuple[str, str]:
+    """Return an unverified local identity hint used only to prevent cross-account pairing."""
+    token = str(id_token or "").strip()
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return "", ""
+        payload_raw = parts[1] + ("=" * (-len(parts[1]) % 4))
+        claims = json.loads(base64.urlsafe_b64decode(payload_raw.encode("ascii")).decode("utf-8"))
+        if not isinstance(claims, dict):
+            return "", ""
+        subject = str(claims.get("sub") or "").strip()
+        email = str(claims.get("email") or "").strip().lower()
+        principal = f"sub:{subject}" if subject else (f"email:{email}" if email else "")
+        return principal, email
+    except Exception:
+        return "", ""
+
+
+def pairing_account_conflict(pairing_state: Dict[str, object], principal: str) -> bool:
+    now = int(time.time())
+    secret = str(pairing_state.get("bridge_secret") or "").strip()
+    expires_at = int(pairing_state.get("bridge_secret_expires_at", 0) or 0)
+    if not secret or (expires_at and now >= expires_at):
+        pairing_state["paired_principal"] = ""
+        pairing_state["paired_account_label"] = ""
+        return False
+    existing = str(pairing_state.get("paired_principal") or "").strip()
+    requested = str(principal or "").strip()
+    return bool(existing and requested and existing != requested)
+
 def make_registration_handler(
     bridge_id: str,
     active_queries: Dict[Tuple[str, str], ActiveQuery],
@@ -709,7 +740,7 @@ def make_registration_handler(
     max_find_results_default: int,
     max_find_results_hard: int,
 ):
-    def _create_pairing_success(requested_caps: List[str]) -> Dict[str, object]:
+    def _create_pairing_success(requested_caps: List[str], principal: str = "", account_label: str = "") -> Dict[str, object]:
         requested_caps = [str(c).strip() for c in (requested_caps if isinstance(requested_caps, list) else []) if str(c).strip()]
         cap_to_service = {
             "local_fs": "local_fs",
@@ -733,6 +764,9 @@ def make_registration_handler(
         now = int(time.time())
         bridge_secret, secret_expires_at = get_or_create_active_bridge_secret(pairing_state, now)
         pairing_state["pair_failures"] = []
+        if str(principal or "").strip():
+            pairing_state["paired_principal"] = str(principal).strip()
+            pairing_state["paired_account_label"] = str(account_label or "").strip().lower()
 
         available_services = compute_available_services(selected_services)
         release_meta = bridge_release_metadata(bridge_id, selected_services, accepted_bridge_ids)
@@ -1035,6 +1069,17 @@ async function decide(decision) {{
                 request_id = secrets.token_urlsafe(18)
                 now = int(time.time())
                 origin = str(payload.get("origin") or "").strip()
+                pair_principal, pair_account_label = pairing_identity_hint(str(payload.get("idToken") or ""))
+                existing_principal = str(pairing_state.get("paired_principal") or "").strip()
+                if existing_principal and (not pair_principal or pairing_account_conflict(pairing_state, pair_principal)):
+                    existing_label = str(pairing_state.get("paired_account_label") or "another Sentienta account").strip()
+                    self._json_response(409, {
+                        "ok": False,
+                        "error": "bridge_account_conflict",
+                        "pairedAccount": existing_label,
+                        "detail": f"This Desktop Automation bridge is already connected to {existing_label}. Disconnect that account from the bridge before connecting a different Sentienta account.",
+                    })
+                    return
                 requested_caps = payload.get("capabilities") if isinstance(payload.get("capabilities"), list) else []
                 _pair_requests()[request_id] = {
                     "status": "pending",
@@ -1042,6 +1087,8 @@ async function decide(decision) {{
                     "expires_at": now + 5 * 60,
                     "origin": origin,
                     "requested_caps": [str(c).strip() for c in requested_caps if str(c).strip()],
+                    "principal": pair_principal,
+                    "account_label": pair_account_label,
                 }
                 available_services = compute_available_services(selected_services)
                 release_meta = bridge_release_metadata(bridge_id, selected_services, accepted_bridge_ids)
@@ -1080,7 +1127,11 @@ async function decide(decision) {{
                     item["status"] = "denied"
                     self._json_response(200, {"ok": True, "status": "denied", "requestId": request_id})
                     return
-                result = _create_pairing_success(item.get("requested_caps") if isinstance(item.get("requested_caps"), list) else [])
+                result = _create_pairing_success(
+                    item.get("requested_caps") if isinstance(item.get("requested_caps"), list) else [],
+                    str(item.get("principal") or ""),
+                    str(item.get("account_label") or ""),
+                )
                 item["status"] = "approved"
                 item["result"] = result
                 self._json_response(200, dict(result, status="approved", requestId=request_id))
@@ -1124,6 +1175,17 @@ async function decide(decision) {{
                         print("[bridge][pair] pairing temporarily rate limited after repeated failures", flush=True)
                     return
 
+                pair_principal, pair_account_label = pairing_identity_hint(str(payload.get("idToken") or ""))
+                existing_principal = str(pairing_state.get("paired_principal") or "").strip()
+                if existing_principal and (not pair_principal or pairing_account_conflict(pairing_state, pair_principal)):
+                    existing_label = str(pairing_state.get("paired_account_label") or "another Sentienta account").strip()
+                    self._json_response(409, {
+                        "ok": False,
+                        "error": "bridge_account_conflict",
+                        "pairedAccount": existing_label,
+                        "detail": f"This Desktop Automation bridge is already connected to {existing_label}. Disconnect that account from the bridge before connecting a different Sentienta account.",
+                    })
+                    return
                 requested_caps = payload.get("capabilities") if isinstance(payload.get("capabilities"), list) else []
                 requested_caps = [str(c).strip() for c in requested_caps if str(c).strip()]
                 cap_to_service = {
@@ -1147,6 +1209,9 @@ async function decide(decision) {{
 
                 bridge_secret, secret_expires_at = get_or_create_active_bridge_secret(pairing_state, now)
                 pairing_state["pair_failures"] = []
+                if pair_principal:
+                    pairing_state["paired_principal"] = pair_principal
+                    pairing_state["paired_account_label"] = pair_account_label
 
                 available_services = compute_available_services(selected_services)
                 release_meta = bridge_release_metadata(bridge_id, selected_services, accepted_bridge_ids)
@@ -1182,6 +1247,8 @@ async function decide(decision) {{
                 pairing_state["bridge_secret"] = ""
                 pairing_state["bridge_secret_expires_at"] = 0
                 pairing_state["paired_at"] = 0
+                pairing_state["paired_principal"] = ""
+                pairing_state["paired_account_label"] = ""
                 with lock:
                     active_queries.clear()
                 _ = persist_pairing_code_file(bridge_id=bridge_id, pairing_state=pairing_state)
