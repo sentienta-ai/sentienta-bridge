@@ -1,5 +1,12 @@
 # Sentienta Bridge Release Notes
 
+## August 3, 2026 - Documentation Correction
+
+- Added complete clone/download, installation, pairing, registration, validation, security, and troubleshooting instructions.
+- Corrected the Enterprise Bridge example to require an active Sentienta Owner/Admin identity and a password supplied through an environment variable.
+- Clarified that the personal bridge generates the six-digit pairing passcode.
+- Clarified that Slack and GitHub are native Connected Services and that general MCP services and Zapier are not part of the public release.
+
 ## August 2, 2026 - Public Workrooms Release
 
 This release prepares the personal and Enterprise Bridges for the Sentienta Workrooms public release.
