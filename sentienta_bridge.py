@@ -694,24 +694,29 @@ def get_or_create_active_bridge_secret(
     return bridge_secret, secret_expires_at
 
 
-def pairing_identity_hint(id_token: str) -> Tuple[str, str]:
-    """Return an unverified local identity hint used only to prevent cross-account pairing."""
+def pairing_identity_hint(id_token: str, principal_hint: str = "", account_label_hint: str = "") -> Tuple[str, str]:
+    """Return a local identity hint used only to prevent accidental cross-account pairing."""
     token = str(id_token or "").strip()
     try:
         parts = token.split(".")
-        if len(parts) < 2:
-            return "", ""
-        payload_raw = parts[1] + ("=" * (-len(parts[1]) % 4))
-        claims = json.loads(base64.urlsafe_b64decode(payload_raw.encode("ascii")).decode("utf-8"))
-        if not isinstance(claims, dict):
-            return "", ""
-        subject = str(claims.get("sub") or "").strip()
-        email = str(claims.get("email") or "").strip().lower()
-        principal = f"sub:{subject}" if subject else (f"email:{email}" if email else "")
-        return principal, email
+        if len(parts) >= 2:
+            payload_raw = parts[1] + ("=" * (-len(parts[1]) % 4))
+            claims = json.loads(base64.urlsafe_b64decode(payload_raw.encode("ascii")).decode("utf-8"))
+            if isinstance(claims, dict):
+                subject = str(claims.get("sub") or "").strip()
+                email = str(claims.get("email") or "").strip().lower()
+                principal = f"sub:{subject}" if subject else (f"email:{email}" if email else "")
+                if principal:
+                    return principal, email
     except Exception:
-        return "", ""
-
+        pass
+    hinted_principal = str(principal_hint or "").strip()
+    hinted_label = str(account_label_hint or "").strip().lower()
+    if hinted_principal:
+        return hinted_principal, hinted_label
+    if hinted_label:
+        return f"email:{hinted_label}", hinted_label
+    return "", ""
 
 def pairing_account_conflict(pairing_state: Dict[str, object], principal: str) -> bool:
     now = int(time.time())
@@ -1069,7 +1074,11 @@ async function decide(decision) {{
                 request_id = secrets.token_urlsafe(18)
                 now = int(time.time())
                 origin = str(payload.get("origin") or "").strip()
-                pair_principal, pair_account_label = pairing_identity_hint(str(payload.get("idToken") or ""))
+                pair_principal, pair_account_label = pairing_identity_hint(
+                    str(payload.get("idToken") or ""),
+                    str(payload.get("accountPrincipal") or ""),
+                    str(payload.get("accountLabel") or ""),
+                )
                 existing_principal = str(pairing_state.get("paired_principal") or "").strip()
                 if existing_principal and (not pair_principal or pairing_account_conflict(pairing_state, pair_principal)):
                     existing_label = str(pairing_state.get("paired_account_label") or "another Sentienta account").strip()
@@ -1175,7 +1184,11 @@ async function decide(decision) {{
                         print("[bridge][pair] pairing temporarily rate limited after repeated failures", flush=True)
                     return
 
-                pair_principal, pair_account_label = pairing_identity_hint(str(payload.get("idToken") or ""))
+                pair_principal, pair_account_label = pairing_identity_hint(
+                    str(payload.get("idToken") or ""),
+                    str(payload.get("accountPrincipal") or ""),
+                    str(payload.get("accountLabel") or ""),
+                )
                 existing_principal = str(pairing_state.get("paired_principal") or "").strip()
                 if existing_principal and (not pair_principal or pairing_account_conflict(pairing_state, pair_principal)):
                     existing_label = str(pairing_state.get("paired_account_label") or "another Sentienta account").strip()
