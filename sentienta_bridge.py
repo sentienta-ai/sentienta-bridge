@@ -2524,6 +2524,14 @@ def execute_fs_list_dir(
             raise BridgeError("args.max_results must be integer") from e
     max_results = max(1, min(max_results, max_results_hard))
 
+    offset = call.args.get("offset", call.args.get("start", 0))
+    if not isinstance(offset, int):
+        try:
+            offset = int(offset)
+        except Exception as e:  # noqa: BLE001
+            raise BridgeError("args.offset must be integer") from e
+    offset = max(0, offset)
+
     path = resolve_fs_path(raw_path, roots)
     if not is_within_roots(path, roots):
         raise BridgeError(f"Path not allowed: {path}")
@@ -2534,7 +2542,8 @@ def execute_fs_list_dir(
 
     entries: List[Dict[str, object]] = []
     children = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-    for child in children[:max_results]:
+    page_children = children[offset:offset + max_results]
+    for child in page_children:
         try:
             stat = child.stat()
             entries.append({
@@ -2547,13 +2556,18 @@ def execute_fs_list_dir(
         except Exception:
             continue
 
+    total_count = len(children)
+    next_offset = offset + len(page_children) if offset + len(page_children) < total_count else None
     return {
         "path": str(path),
         "entries": entries,
         "count": len(entries),
-        "truncated": len(children) > max_results,
+        "total_count": total_count,
+        "offset": offset,
+        "next_offset": next_offset,
+        "remaining_count": max(0, total_count - (offset + len(page_children))),
+        "truncated": next_offset is not None,
     }
-
 def execute_fs_read_text(call: BridgeCall, roots: List[Path], max_chars_default: int, max_chars_hard: int) -> Dict[str, object]:
     raw_path = str(call.args.get("path", "")).strip()
     if not raw_path:

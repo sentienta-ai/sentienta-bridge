@@ -1,5 +1,10 @@
 # Sentienta Bridge Release Notes
 
+## August 3, 2026 - Local File Services Result Continuation
+
+- Directory listings now return total-count, offset, next-page, and remaining-count metadata.
+- Truncated directory results can be continued with a subsequent natural-language request.
+- Explicit requests for all files use the bridge's safe maximum page size.
 ## August 3, 2026 - Documentation Correction
 
 - Added complete clone/download, installation, pairing, registration, validation, security, and troubleshooting instructions.
