@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Sentienta desktop bridge v2.
 
@@ -283,18 +283,19 @@ def main() -> int:
                 bridge_calls: List[bridge.BridgeCall] = []
                 try:
                     outbox_messages: List[object] = []
+                    outbox_responses = bridge.poll_bridge_message_channels(
+                        query_endpoint=args.query_endpoint,
+                        headers=poll_headers,
+                        team_name=q.team_name,
+                        query_id=q.query_id,
+                        bridge_ids=accepted_bridge_ids,
+                        user_id=q.user_id,
+                    )
                     for poll_bridge_id in accepted_bridge_ids:
                         debug_meta: Dict[str, object] = {}
                         backend_debug_version = ""
                         backend_cfg_version = ""
-                        outbox_resp = bridge.poll_bridge_messages(
-                            query_endpoint=args.query_endpoint,
-                            headers=poll_headers,
-                            team_name=q.team_name,
-                            query_id=q.query_id,
-                            bridge_id=poll_bridge_id,
-                            user_id=q.user_id,
-                        )
+                        outbox_resp = outbox_responses.get(poll_bridge_id, {})
                         current_messages: object = []
                         parsed_body: Dict[str, object] = {}
 

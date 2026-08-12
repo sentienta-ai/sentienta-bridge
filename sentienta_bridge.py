@@ -28,6 +28,7 @@ import threading
 import time
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -1856,6 +1857,39 @@ def poll_bridge_messages(
         payload["userID"] = user_id
         payload["username"] = user_id
     return http_post_json(query_endpoint, payload, headers)
+
+
+def poll_bridge_message_channels(
+    query_endpoint: str,
+    headers: Dict[str, str],
+    team_name: str,
+    query_id: str,
+    bridge_ids: List[str],
+    user_id: str = "",
+) -> Dict[str, Dict[str, object]]:
+    """Poll independent service outboxes concurrently to avoid alias-order latency."""
+    ids = [str(item or "").strip() for item in bridge_ids if str(item or "").strip()]
+    if len(ids) <= 1:
+        return {
+            bridge_id: poll_bridge_messages(
+                query_endpoint, headers, team_name, query_id, bridge_id, user_id
+            )
+            for bridge_id in ids
+        }
+    with ThreadPoolExecutor(max_workers=len(ids), thread_name_prefix="bridge-poll") as pool:
+        futures = {
+            bridge_id: pool.submit(
+                poll_bridge_messages,
+                query_endpoint,
+                headers,
+                team_name,
+                query_id,
+                bridge_id,
+                user_id,
+            )
+            for bridge_id in ids
+        }
+        return {bridge_id: future.result() for bridge_id, future in futures.items()}
 
 
 def extract_bridge_calls_from_messages(messages: object) -> List[BridgeCall]:
@@ -8141,18 +8175,19 @@ def main() -> int:
                     # New path: poll Core outbox channel for bridge-targeted messages.
                     outbox_messages: List[object] = []
                     mcp_any_pending = False
+                    outbox_responses = poll_bridge_message_channels(
+                        query_endpoint=args.query_endpoint,
+                        headers=poll_headers,
+                        team_name=q.team_name,
+                        query_id=q.query_id,
+                        bridge_ids=accepted_bridge_ids,
+                        user_id=q.user_id,
+                    )
                     for poll_bridge_id in accepted_bridge_ids:
                         debug_meta: Dict[str, object] = {}
                         backend_debug_version = ""
                         backend_cfg_version = ""
-                        outbox_resp = poll_bridge_messages(
-                            query_endpoint=args.query_endpoint,
-                            headers=poll_headers,
-                            team_name=q.team_name,
-                            query_id=q.query_id,
-                            bridge_id=poll_bridge_id,
-                            user_id=q.user_id,
-                        )
+                        outbox_resp = outbox_responses.get(poll_bridge_id, {})
                         current_messages: object = []
                         parsed_body: Dict[str, object] = {}
 

@@ -1,5 +1,11 @@
 # Sentienta Bridge Release Notes
 
+## August 12, 2026 - Faster Independent Service Polling
+
+- Personal Bridge polling now checks independent service outbox channels concurrently instead of waiting for each bridge alias in sequence.
+- The personal v2 entry point uses the shared concurrent polling implementation.
+- This reduces avoidable startup latency for Local File Services and OpenClaw requests without changing permissions, pairing, execution, or result handling.
+
 ## August 3, 2026 - Simpler Local File Services Startup
 
 - The Windows launcher now starts the recommended personal bridge with Local File Services and OpenClaw enabled.
