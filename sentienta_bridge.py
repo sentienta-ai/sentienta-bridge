@@ -55,6 +55,20 @@ OPENCLAW_EXEC_SERVICE = "openclaw_exec"
 DEFAULT_STABLE_SERVICES = ("openclaw_exec",)
 MCP_PREVIEW_SERVICE = "mcp"
 NATIVE_BROWSER_SERVICE = "native_browser"
+FS_BROWSER_COMPAT_PREFIX = "fs.browser."
+FS_BROWSER_COMPAT_TOOLS = frozenset({
+    "fs.browser.open",
+    "fs.browser.inspect_form",
+    "fs.browser.activate_action",
+    "fs.browser.begin_auth_handoff",
+    "fs.browser.end_auth_handoff",
+    "fs.browser.fill_form",
+    "fs.browser.attach_file",
+    "fs.browser.wait_for_page_change",
+    "fs.browser.screenshot",
+    "fs.browser.cancel",
+    "fs.browser.close",
+})
 BRIDGE_ID_SERVICE_POLICY: Dict[str, Tuple[str, ...]] = {
     "desktop_fs": ("local_fs",),
     "desktop_openclaw": ("openclaw_exec",),
@@ -631,6 +645,8 @@ def _record_pair_failure(pairing_state: Dict[str, object], now: Optional[int] = 
 
 def compute_available_services(selected_services: List[str]) -> List[str]:
     services: List[str] = []
+    if NATIVE_BROWSER_SERVICE in selected_services:
+        services.append(NATIVE_BROWSER_SERVICE)
     if "local_fs" in selected_services:
         services.append("local_fs")
     if "openclaw_exec" in selected_services:
@@ -643,6 +659,7 @@ def compute_available_services(selected_services: List[str]) -> List[str]:
 
 def format_available_service_names(selected_services: List[str]) -> str:
     labels = {
+        NATIVE_BROWSER_SERVICE: "Native Browser",
         "local_fs": "Local File Services",
         "openclaw_exec": "OpenClaw",
         MCP_PREVIEW_SERVICE: "MCP Services",
@@ -1119,6 +1136,8 @@ async function decide(decision) {{
                 base_url = f"http://{host}"
                 approval_url = f"{base_url}/pair/approve?{urlencode({'requestId': request_id})}"
                 status_url = f"{base_url}/pair/status?{urlencode({'requestId': request_id})}"
+                if verbose:
+                    print(f"[bridge][pair] approval_url={approval_url}", flush=True)
                 self._json_response(
                     202,
                     {
@@ -7759,6 +7778,34 @@ def execute_native_browser_call(call: BridgeCall, roots: List[Path]) -> Dict[str
         raise BridgeError(str(exc)) from exc
 
 
+def translate_fs_browser_compat_call(call: BridgeCall) -> BridgeCall:
+    """Temporary pre-Core compatibility shim for native-browser workflow tests.
+
+    Core currently routes only fs.*, openclaw.*, and mcp.* workflow bridge calls.
+    The unreleased Bridge accepts a deliberately narrow fs.browser.* vocabulary
+    and translates it to the native browser worker. Publishing/submission is
+    intentionally excluded until Core has a first-class governed browser service.
+    """
+    requested_tool = str(call.tool or "").strip()
+    if not requested_tool.startswith(FS_BROWSER_COMPAT_PREFIX):
+        return call
+    if requested_tool not in FS_BROWSER_COMPAT_TOOLS:
+        raise BridgeError(f"Unsupported temporary browser compatibility tool: {requested_tool}")
+    browser_tool = "browser." + requested_tool[len(FS_BROWSER_COMPAT_PREFIX):]
+    return BridgeCall(
+        msg_id=call.msg_id,
+        bridge_id=call.bridge_id,
+        tool=browser_tool,
+        args=dict(call.args or {}),
+        raw={
+            **dict(call.raw or {}),
+            "compatibility_alias": requested_tool,
+            "actual_service": NATIVE_BROWSER_SERVICE,
+            "temporary_shim": True,
+        },
+    )
+
+
 def execute_call(
     call: BridgeCall,
     roots: List[Path],
@@ -7769,7 +7816,34 @@ def execute_call(
     max_find_results_default: int,
     max_find_results_hard: int,
 ) -> Dict[str, object]:
-    if str(call.tool or "").strip().startswith("browser."):
+    # Native browser preparation is an implementation of Desktop Automation,
+    # not a separately granted agent service. Core's existing readiness probe
+    # still uses the legacy OpenClaw healthcheck name, so a composite bridge
+    # answers it directly without launching or depending on OpenClaw.
+    if call.tool == "openclaw.healthcheck" and NATIVE_BROWSER_SERVICE in selected_services:
+        scope = str((call.args or {}).get("scope") or "all").strip().lower() or "all"
+        return {
+            "tool": "openclaw.healthcheck",
+            "scope": scope,
+            "cli": {"ok": True, "path": "native_browser", "detail": "Desktop Automation bridge ready."},
+            "runtime": {"ok": True, "detail": "Native browser runtime ready.", "raw": ""},
+            "agents": {"ok": True, "count": 1, "detail": "Desktop Automation controller available."},
+            "agent_rows": [],
+            "template_agent": {"ok": True, "agent_id": "main", "detail": "Desktop Automation controller available."},
+            "warnings": [],
+        }
+    requested_tool = str(call.tool or "").strip()
+    if requested_tool.startswith(FS_BROWSER_COMPAT_PREFIX):
+        if NATIVE_BROWSER_SERVICE not in selected_services:
+            raise BridgeError("Service disabled: native_browser")
+        translated_call = translate_fs_browser_compat_call(call)
+        result = execute_native_browser_call(translated_call, roots)
+        result["requested_tool"] = requested_tool
+        result["tool"] = str(translated_call.tool or "").strip()
+        result["service_family"] = NATIVE_BROWSER_SERVICE
+        result["compatibility_shim"] = "fs.browser"
+        return result
+    if requested_tool.startswith("browser."):
         if NATIVE_BROWSER_SERVICE not in selected_services:
             raise BridgeError("Service disabled: native_browser")
         return execute_native_browser_call(call, roots)
