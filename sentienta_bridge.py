@@ -50,10 +50,11 @@ BRIDGE_PROTOCOL_VERSION = "bridge-protocol-v1"
 MCP_GOVERNANCE_SCHEMA_VERSION = "mcp-governance-v1"
 STABLE_BRIDGE_VERSION = "2026-06-01-stable-v1"
 MCP_PREVIEW_BRIDGE_VERSION = "2026-06-03-mcp-preview-v4"
-SUPPORTED_SERVICES = ("local_fs", "openclaw_exec", "mcp")
+SUPPORTED_SERVICES = ("local_fs", "openclaw_exec", "mcp", "native_browser")
 OPENCLAW_EXEC_SERVICE = "openclaw_exec"
 DEFAULT_STABLE_SERVICES = ("openclaw_exec",)
 MCP_PREVIEW_SERVICE = "mcp"
+NATIVE_BROWSER_SERVICE = "native_browser"
 BRIDGE_ID_SERVICE_POLICY: Dict[str, Tuple[str, ...]] = {
     "desktop_fs": ("local_fs",),
     "desktop_openclaw": ("openclaw_exec",),
@@ -62,12 +63,16 @@ BRIDGE_ID_SERVICE_POLICY: Dict[str, Tuple[str, ...]] = {
     "desktop_mcp_github": ("mcp",),
     "desktop_mcp_zapier": ("mcp",),
     "desktop_mcp_google_calendar": ("mcp",),
+    "desktop_browser": ("native_browser",),
 }
 SERVICE_TO_BRIDGE_ID: Dict[str, str] = {
     "local_fs": "desktop_fs",
     "openclaw_exec": "desktop_openclaw",
     "mcp": "desktop_mcp_preview",
+    "native_browser": "desktop_browser",
 }
+
+_NATIVE_BROWSER_WORKER = None
 MCP_SERVER_REGISTRY: Dict[str, Dict[str, object]] = {
     "slack": {
         "display_name": "Slack",
@@ -7733,6 +7738,27 @@ def execute_mcp_call(call: BridgeCall, pairing_state: Dict[str, object]) -> Dict
     raise BridgeError(f"Unsupported MCP read-only tool: {call.tool}")
 
 
+def execute_native_browser_call(call: BridgeCall, roots: List[Path]) -> Dict[str, object]:
+    global _NATIVE_BROWSER_WORKER
+    try:
+        from sentienta_browser_worker import BrowserWorker, BrowserWorkerError
+        if _NATIVE_BROWSER_WORKER is None:
+            _NATIVE_BROWSER_WORKER = BrowserWorker(attachment_roots=roots)
+        result = _NATIVE_BROWSER_WORKER.dispatch(
+            str(call.tool or "").strip(),
+            dict(call.args or {}),
+            request_id=str(call.msg_id or "").strip(),
+        )
+        return {
+            **result,
+            "tool": str(call.tool or "").strip(),
+            "status": "completed",
+            "service_family": NATIVE_BROWSER_SERVICE,
+        }
+    except BrowserWorkerError as exc:
+        raise BridgeError(str(exc)) from exc
+
+
 def execute_call(
     call: BridgeCall,
     roots: List[Path],
@@ -7743,6 +7769,10 @@ def execute_call(
     max_find_results_default: int,
     max_find_results_hard: int,
 ) -> Dict[str, object]:
+    if str(call.tool or "").strip().startswith("browser."):
+        if NATIVE_BROWSER_SERVICE not in selected_services:
+            raise BridgeError("Service disabled: native_browser")
+        return execute_native_browser_call(call, roots)
     if call.tool == "fs.find_files":
         if "local_fs" not in selected_services:
             raise BridgeError("Service disabled: local_fs")

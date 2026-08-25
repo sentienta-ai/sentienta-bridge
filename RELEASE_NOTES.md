@@ -1,5 +1,11 @@
 # Sentienta Bridge Release Notes
 
+## Unreleased native-browser prototype
+
+- Added a visible, dedicated-profile `native_browser` service for ordinary Sentienta Workflow bridge calls.
+- Added bounded page inspection across open Shadow DOM roots, verified navigation and field filling, and governed image attachment from approved local roots.
+- Publication remains a distinct operation and is not performed by the draft-preparation workflow.
+
 ## August 12, 2026 - Faster Independent Service Polling
 
 - Personal Bridge polling now checks independent service outbox channels concurrently instead of waiting for each bridge alias in sequence.
