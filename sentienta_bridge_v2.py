@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Tuple
 import html
 import json
 import secrets
+import sys
 import threading
 import time
 
@@ -154,6 +155,14 @@ def _refresh_local_openclaw_inventory(
 
 def main() -> int:
     args = bridge.parse_args()
+    port_state = bridge.inspect_local_bridge_port(args.listen_port)
+    if port_state.get("status") != "available":
+        print(
+            f"ERROR: {bridge.bridge_port_startup_message(port_state)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 3
     roots: List[Path] = []
     for raw_root in args.allow_root or []:
         root = Path(str(raw_root or "").strip()).expanduser().resolve()
@@ -234,22 +243,33 @@ def main() -> int:
         )
         active_queries[(seed.team_name, seed.query_id)] = seed
 
-    server = bridge.start_registration_server(
-        port=args.listen_port,
-        bridge_id=args.bridge_id,
-        active_queries=active_queries,
-        lock=active_lock,
-        default_auth_headers=headers,
-        query_endpoint=args.query_endpoint,
-        pairing_state=pairing_state,
-        roots=roots,
-        selected_services=selected_services,
-        accepted_bridge_ids=accepted_bridge_ids,
-        max_chars_default=args.max_chars_default,
-        max_chars_hard=args.max_chars_hard,
-        max_find_results_default=args.max_find_results_default,
-        max_find_results_hard=args.max_find_results_hard,
-    )
+    try:
+        server = bridge.start_registration_server(
+            port=args.listen_port,
+            bridge_id=args.bridge_id,
+            active_queries=active_queries,
+            lock=active_lock,
+            default_auth_headers=headers,
+            query_endpoint=args.query_endpoint,
+            pairing_state=pairing_state,
+            roots=roots,
+            selected_services=selected_services,
+            accepted_bridge_ids=accepted_bridge_ids,
+            max_chars_default=args.max_chars_default,
+            max_chars_hard=args.max_chars_hard,
+            max_find_results_default=args.max_find_results_default,
+            max_find_results_hard=args.max_find_results_hard,
+        )
+    except OSError:
+        port_state = bridge.inspect_local_bridge_port(args.listen_port)
+        if port_state.get("status") == "available":
+            port_state = {"status": "occupied", "port": int(args.listen_port)}
+        print(
+            f"ERROR: {bridge.bridge_port_startup_message(port_state)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 3
     print(f"[bridge-v2] registration endpoint listening on http://127.0.0.1:{args.listen_port}/register-query", flush=True)
 
     seen_call_ids: set[tuple[str, str, str]] = set()
