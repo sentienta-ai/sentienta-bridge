@@ -22,6 +22,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -730,6 +731,52 @@ def pairing_account_conflict(pairing_state: Dict[str, object], principal: str) -
     existing = str(pairing_state.get("paired_principal") or "").strip()
     requested = str(principal or "").strip()
     return bool(existing and requested and existing != requested)
+
+
+def inspect_local_bridge_port(port: int, timeout: float = 0.6) -> Dict[str, object]:
+    """Classify a local listener without exposing process details."""
+    port = int(port)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(max(0.1, float(timeout)))
+    try:
+        if sock.connect_ex(("127.0.0.1", port)) != 0:
+            return {"status": "available", "port": port}
+    finally:
+        sock.close()
+    try:
+        req = Request(url=f"http://127.0.0.1:{port}/health", method="GET")
+        with urlopen(req, timeout=max(0.1, float(timeout))) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+        if isinstance(payload, dict) and payload.get("ok") is True and payload.get("bridgeId"):
+            return {
+                "status": "sentienta_bridge",
+                "port": port,
+                "bridgeId": str(payload.get("bridgeId") or "").strip(),
+                "paired": bool(payload.get("paired")),
+                "pairedAccount": str(payload.get("pairedAccount") or "").strip().lower(),
+            }
+    except Exception:
+        pass
+    return {"status": "occupied", "port": port}
+
+
+def bridge_port_startup_message(port_state: Dict[str, object]) -> str:
+    port = int((port_state or {}).get("port") or 8765)
+    status = str((port_state or {}).get("status") or "occupied").strip()
+    if status == "sentienta_bridge":
+        paired = bool((port_state or {}).get("paired"))
+        account = str((port_state or {}).get("pairedAccount") or "").strip()
+        pairing = f" It is paired with {account}." if paired and account else (
+            " It is already paired." if paired else " It is waiting to be paired."
+        )
+        return (
+            f"Sentienta Bridge is already running on port {port}.{pairing} "
+            "Use the existing Bridge window, or stop it before starting another instance."
+        )
+    return (
+        f"Port {port} is already in use by another application. "
+        "Stop that application or start Sentienta Bridge with a different --listen-port value."
+    )
 
 def make_registration_handler(
     bridge_id: str,
@@ -8014,6 +8061,10 @@ def post_mcp_approval_decision_governance_event(
 
 def main() -> int:
     args = parse_args()
+    port_state = inspect_local_bridge_port(args.listen_port)
+    if port_state.get("status") != "available":
+        print(f"ERROR: {bridge_port_startup_message(port_state)}", file=sys.stderr, flush=True)
+        return 3
     roots: List[Path] = [Path(r).expanduser().resolve() for r in getattr(args, "allow_root", [])]
     selected_services = resolve_selected_services(args.service, args.bridge_id)
     if MCP_PREVIEW_SERVICE in selected_services:
@@ -8112,22 +8163,29 @@ def main() -> int:
         )
         active_queries[(seed.team_name, seed.query_id)] = seed
 
-    server = start_registration_server(
-        port=args.listen_port,
-        bridge_id=args.bridge_id,
-        active_queries=active_queries,
-        lock=active_lock,
-        default_auth_headers=headers,
-        query_endpoint=args.query_endpoint,
-        pairing_state=pairing_state,
-        roots=roots,
-        selected_services=selected_services,
-        accepted_bridge_ids=accepted_bridge_ids,
-        max_chars_default=args.max_chars_default,
-        max_chars_hard=args.max_chars_hard,
-        max_find_results_default=args.max_find_results_default,
-        max_find_results_hard=args.max_find_results_hard,
-    )
+    try:
+        server = start_registration_server(
+            port=args.listen_port,
+            bridge_id=args.bridge_id,
+            active_queries=active_queries,
+            lock=active_lock,
+            default_auth_headers=headers,
+            query_endpoint=args.query_endpoint,
+            pairing_state=pairing_state,
+            roots=roots,
+            selected_services=selected_services,
+            accepted_bridge_ids=accepted_bridge_ids,
+            max_chars_default=args.max_chars_default,
+            max_chars_hard=args.max_chars_hard,
+            max_find_results_default=args.max_find_results_default,
+            max_find_results_hard=args.max_find_results_hard,
+        )
+    except OSError:
+        port_state = inspect_local_bridge_port(args.listen_port)
+        if port_state.get("status") == "available":
+            port_state = {"status": "occupied", "port": int(args.listen_port)}
+        print(f"ERROR: {bridge_port_startup_message(port_state)}", file=sys.stderr, flush=True)
+        return 3
     print(f"[bridge] registration endpoint listening on http://127.0.0.1:{args.listen_port}/register-query", flush=True)
 
     # De-dupe per query thread, not globally by msg_id.

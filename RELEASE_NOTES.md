@@ -1,5 +1,12 @@
 # Sentienta Bridge Release Notes
 
+## September 23, 2026 - Duplicate Bridge Detection
+
+- Bridge startup now detects an existing compatible Sentienta Bridge before binding the configured port.
+- A second Bridge exits with a clear message that identifies whether the existing Bridge is paired and, when safe, the paired account.
+- An unrelated process occupying the port is reported separately with the configured port number and a safe next action.
+- A bind race is rechecked and reported without exposing process details, secrets, tokens, or passcodes.
+
 ## August 12, 2026 - Faster Independent Service Polling
 
 - Personal Bridge polling now checks independent service outbox channels concurrently instead of waiting for each bridge alias in sequence.
