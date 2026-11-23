@@ -36,6 +36,7 @@ SUPPORTED_BROWSER_TOOLS = {
     "browser.open",
     "browser.inspect_form",
     "browser.read_page",
+    "browser.read_url",
     "browser.activate_action",
     "browser.begin_auth_handoff",
     "browser.end_auth_handoff",
@@ -700,6 +701,42 @@ class BrowserWorker:
 
     def browser_inspect_form(self, args: Dict[str, object]) -> Dict[str, object]:
         return {"ok": True, **self._inspect(self._session(args))}
+
+    def browser_read_url(self, args: Dict[str, object]) -> Dict[str, object]:
+        """Read-only: open each public page, read its rendered text, and close it.
+
+        One call per batch keeps round trips low for a remote team. Each page gets
+        its own short-lived profile; nothing is clicked, filled or submitted.
+        """
+        urls = args.get("urls")
+        if not isinstance(urls, list) or not 1 <= len(urls) <= 4:
+            raise BrowserWorkerError("urls must list one to four public page addresses.")
+        delegation_id = str(args.get("delegation_id") or "").strip() or "read_url"
+        try:
+            max_chars = max(1000, min(int(args.get("max_chars") or 14000), 14000))
+        except (TypeError, ValueError):
+            raise BrowserWorkerError("max_chars must be a whole number.")
+        pages = []
+        for url in urls:
+            session_id = ""
+            try:
+                opened = self.browser_open({"delegation_id": delegation_id, "url": str(url)})
+                session_id = str(opened.get("browser_session_id") or "")
+                page = self.browser_read_page({"browser_session_id": session_id, "delegation_id": delegation_id,
+                                               "max_chars": max_chars})
+                pages.append({"url": str(url), "ok": True, "finalURL": page.get("url"), "title": page.get("title"),
+                              "text": page.get("text"), "textLength": page.get("text_length"),
+                              "textTruncated": page.get("text_truncated"),
+                              "links": (page.get("links") or [])[:150], "images": (page.get("images") or [])[:20]})
+            except BrowserWorkerError as error:
+                pages.append({"url": str(url), "ok": False, "error": str(error)[:300]})
+            finally:
+                if session_id:
+                    try:
+                        self.browser_close({"browser_session_id": session_id, "delegation_id": delegation_id, "delete_profile": True})
+                    except BrowserWorkerError:
+                        pass
+        return {"ok": True, "pages": pages}
 
     def browser_read_page(self, args: Dict[str, object]) -> Dict[str, object]:
         """Read-only: the rendered page's visible text and links, as a person would see them.

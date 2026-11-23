@@ -61,6 +61,7 @@ FS_BROWSER_COMPAT_TOOLS = frozenset({
     "fs.browser.open",
     "fs.browser.inspect_form",
     "fs.browser.read_page",
+    "fs.browser.read_url",
     "fs.browser.activate_action",
     "fs.browser.begin_auth_handoff",
     "fs.browser.end_auth_handoff",
@@ -89,6 +90,7 @@ SERVICE_TO_BRIDGE_ID: Dict[str, str] = {
 }
 
 _NATIVE_BROWSER_WORKER = None
+_NATIVE_BROWSER_READER = None
 MCP_SERVER_REGISTRY: Dict[str, Dict[str, object]] = {
     "slack": {
         "display_name": "Slack",
@@ -7809,9 +7811,17 @@ def execute_native_browser_call(call: BridgeCall, roots: List[Path]) -> Dict[str
     global _NATIVE_BROWSER_WORKER
     try:
         from sentienta_browser_worker import BrowserWorker, BrowserWorkerError
-        if _NATIVE_BROWSER_WORKER is None:
-            _NATIVE_BROWSER_WORKER = BrowserWorker(attachment_roots=roots)
-        result = _NATIVE_BROWSER_WORKER.dispatch(
+        if str(call.tool or "").strip() == "browser.read_url":
+            # Reading for a remote team runs out of sight: a headless worker of its own.
+            global _NATIVE_BROWSER_READER
+            if _NATIVE_BROWSER_READER is None:
+                _NATIVE_BROWSER_READER = BrowserWorker(headless=True)
+            worker = _NATIVE_BROWSER_READER
+        else:
+            if _NATIVE_BROWSER_WORKER is None:
+                _NATIVE_BROWSER_WORKER = BrowserWorker(attachment_roots=roots)
+            worker = _NATIVE_BROWSER_WORKER
+        result = worker.dispatch(
             str(call.tool or "").strip(),
             dict(call.args or {}),
             request_id=str(call.msg_id or "").strip(),
