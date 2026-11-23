@@ -1,10 +1,12 @@
 # Sentienta Bridge Release Notes
 
-## Unreleased native-browser prototype
+## November 23, 2026 - Native Browser
 
-- Added a visible, dedicated-profile `native_browser` service for ordinary Sentienta Workflow bridge calls.
+- Added the `native_browser` service (`--service native_browser`): a dedicated-profile Chrome or Edge browser for Sentienta Workflow bridge calls.
 - Added bounded page inspection across open Shadow DOM roots, verified navigation and field filling, and governed image attachment from approved local roots.
+- Added read-only `browser.read_page` and `browser.read_url`, which return a rendered page's visible text, links and images after its content finishes loading. `browser.read_url` reads up to four pages in one call in a separate headless browser, so remote reads never open windows on screen. Nothing is clicked, filled or submitted.
 - Publication remains a distinct operation and is not performed by the draft-preparation workflow.
+- The Windows launcher now enables the native browser alongside Local File Services and OpenClaw.
 
 ## September 23, 2026 - Duplicate Bridge Detection
 

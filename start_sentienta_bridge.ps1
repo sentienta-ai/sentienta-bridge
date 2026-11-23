@@ -18,5 +18,6 @@ python $BridgeScript `
   --allow-root $AllowRoot `
   --service local_fs `
   --service openclaw_exec `
+  --service native_browser `
   --openclaw-cli $OpenClawCli `
   --listen-port $ListenPort
