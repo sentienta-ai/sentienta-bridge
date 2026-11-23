@@ -60,6 +60,7 @@ FS_BROWSER_COMPAT_PREFIX = "fs.browser."
 FS_BROWSER_COMPAT_TOOLS = frozenset({
     "fs.browser.open",
     "fs.browser.inspect_form",
+    "fs.browser.read_page",
     "fs.browser.activate_action",
     "fs.browser.begin_auth_handoff",
     "fs.browser.end_auth_handoff",

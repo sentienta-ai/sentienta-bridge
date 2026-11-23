@@ -35,6 +35,7 @@ from websockets.sync.client import connect
 SUPPORTED_BROWSER_TOOLS = {
     "browser.open",
     "browser.inspect_form",
+    "browser.read_page",
     "browser.activate_action",
     "browser.begin_auth_handoff",
     "browser.end_auth_handoff",
@@ -699,6 +700,55 @@ class BrowserWorker:
 
     def browser_inspect_form(self, args: Dict[str, object]) -> Dict[str, object]:
         return {"ok": True, **self._inspect(self._session(args))}
+
+    def browser_read_page(self, args: Dict[str, object]) -> Dict[str, object]:
+        """Read-only: the rendered page's visible text and links, as a person would see them.
+
+        Script-built pages (listings, inventories) carry their content only after
+        rendering, so this reads the live document rather than the downloaded HTML.
+        Nothing on the page is clicked, filled or submitted.
+        """
+        session = self._session(args)
+        self._wait_ready(session)
+        try:
+            max_chars = int(args.get("max_chars") or 60000)
+        except (TypeError, ValueError):
+            raise BrowserWorkerError("max_chars must be a whole number.")
+        max_chars = max(1000, min(max_chars, 200000))
+        # Listings often arrive after the page reports ready: wait until the visible
+        # text stops growing (bounded), so a read does not catch an empty shell.
+        try:
+            settle = float(args.get("settle_seconds") or 10)
+        except (TypeError, ValueError):
+            raise BrowserWorkerError("settle_seconds must be a number.")
+        deadline = time.time() + max(0.0, min(settle, 30.0))
+        last, stable_since = -1, time.time()
+        while time.time() < deadline:
+            length = int(self._evaluate(session, "(document.body ? document.body.innerText.length : 0)") or 0)
+            if length != last:
+                last, stable_since = length, time.time()
+            elif time.time() - stable_since >= 2.0:
+                break
+            time.sleep(0.5)
+        page = self._evaluate(session, """(() => {
+            const text = (document.body ? document.body.innerText : '') || '';
+            const links = [];
+            const seen = new Set();
+            for (const a of document.querySelectorAll('a[href]')) {
+                const href = a.href;
+                if (!/^https?:/i.test(href) || seen.has(href)) continue;
+                seen.add(href);
+                links.push({href, text: (a.innerText || a.getAttribute('aria-label') || '').trim().slice(0, 160)});
+                if (links.length >= 400) break;
+            }
+            const images = [...document.images].map(i => i.currentSrc || i.src).filter(s => /^https?:/i.test(s)).slice(0, 40);
+            return {url: location.href, title: document.title, text, links, images};
+        })()""") or {}
+        text = str(page.get("text") or "")
+        return {"ok": True, "browser_session_id": session.session_id if hasattr(session, "session_id") else args.get("browser_session_id"),
+                "url": page.get("url"), "title": page.get("title"),
+                "text": text[:max_chars], "text_truncated": len(text) > max_chars, "text_length": len(text),
+                "links": page.get("links") or [], "images": page.get("images") or []}
 
     def browser_begin_auth_handoff(self, args: Dict[str, object]) -> Dict[str, object]:
         session = self._session(args)
