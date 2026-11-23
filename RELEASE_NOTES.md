@@ -1,5 +1,10 @@
 # Sentienta Bridge Release Notes
 
+## November 23, 2026 - Work Without an Open Page
+
+- When paired from the Sentienta v3 page, the Bridge can keep itself signed in: it renews its own sign-in before it expires and keeps every work queue's credentials current. The renewal token is held in memory only, sent only to Cognito, and cleared on unpair; restarting the Bridge requires pairing again.
+- The Bridge asks Sentienta for pending v3 work about every 15 seconds and registers it, so the team's browser reads continue after the Sentienta page is closed. Queues it registered are retired once they are no longer pending.
+
 ## November 23, 2026 - Native Browser
 
 - Added the `native_browser` service (`--service native_browser`): a dedicated-profile Chrome or Edge browser for Sentienta Workflow bridge calls.
