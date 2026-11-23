@@ -283,8 +283,23 @@ def main() -> int:
         pairing_file,
     )
 
+    import bridge_session
+
+    def _new_query(team_name: str, query_id: str, user_id: str, query_headers: Dict[str, str]) -> bridge.ActiveQuery:
+        started = time.time()
+        return bridge.ActiveQuery(team_name=team_name, query_id=query_id, user_id=user_id, dialog_index=-1,
+                                  registered_ts=started, last_seen_ts=started, auth_headers=query_headers,
+                                  next_bridge_poll_ts=0.0, last_bridge_activity_ts=started)
+
+    def _session_headers(token: str) -> Dict[str, str]:
+        return bridge.auth_headers(auth_mode="id-token", id_token=token, owner_key="", owner_key_header="x-owner-key")[0]
+
     try:
         while True:
+            # With an owner session, renew sign-in and pick up pending v3 work
+            # (about every 15 seconds) so no Sentienta page has to stay open.
+            bridge_session.maintain(active_queries, active_lock, _new_query, _session_headers,
+                                    log=lambda message: print(message, flush=True))
             with active_lock:
                 snapshot = list(active_queries.values())
             loop_sleep = max(0.1, args.poll_ms / 1000.0)

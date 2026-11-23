@@ -1328,6 +1328,11 @@ async function decide(decision) {{
                 return
 
             if self.path == "/unpair":
+                try:
+                    import bridge_session
+                    bridge_session.install(None)
+                except Exception:
+                    pass
                 header_secret = str(self.headers.get("X-Bridge-Secret", "")).strip()
                 payload_secret = str(payload.get("bridgeSecret", "")).strip()
                 expected_secret = str(pairing_state.get("bridge_secret", "") or "").strip()
@@ -1772,6 +1777,24 @@ async function decide(decision) {{
                 self._json_response(400, {"ok": False, "error": "invalid_auth", "detail": str(e)})
                 return
             merged_headers = req_headers if has_auth_credential(req_headers) else dict(default_auth_headers)
+            refresh_token = str(payload.get("refreshToken", "") or "").strip()
+            v3_endpoint = str(payload.get("v3Endpoint", "") or "").strip()
+            if refresh_token and v3_endpoint and user_id:
+                # Keep this owner signed in and finding v3 work without an open page.
+                # Held in memory only; sent nowhere but Cognito and the Sentienta API.
+                endpoint_host = (urlparse(v3_endpoint).hostname or "").lower()
+                query_host = (urlparse(query_endpoint or DEFAULT_QUERY_ENDPOINT).hostname or "").lower()
+                region = str(payload.get("cognitoRegion", "") or "us-west-2").strip()
+                client_id = str(payload.get("cognitoClientId", "") or "").strip()
+                if (urlparse(v3_endpoint).scheme == "https" and endpoint_host == query_host and client_id
+                        and re.fullmatch(r"[a-z]{2}-[a-z]+-\d", region)):
+                    import bridge_session
+                    current_session = bridge_session.current()
+                    if current_session is None or current_session.user_id != user_id or current_session.v3_endpoint != v3_endpoint:
+                        print("[bridge][session] owner session installed; v3 work is found without the page", flush=True)
+                    bridge_session.install(bridge_session.OwnerSession(
+                        user_id=user_id, refresh_token=refresh_token, client_id=client_id, region=region,
+                        v3_endpoint=v3_endpoint, id_token=id_token))
             record_bridge_debug_event(
                 pairing_state,
                 "register_query",
