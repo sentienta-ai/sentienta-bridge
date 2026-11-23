@@ -1,5 +1,11 @@
 # Sentienta Bridge Release Notes
 
+## Unreleased native-browser prototype
+
+- Added a visible, dedicated-profile `native_browser` service for ordinary Sentienta Workflow bridge calls.
+- Added bounded page inspection across open Shadow DOM roots, verified navigation and field filling, and governed image attachment from approved local roots.
+- Publication remains a distinct operation and is not performed by the draft-preparation workflow.
+
 ## September 23, 2026 - Duplicate Bridge Detection
 
 - Bridge startup now detects an existing compatible Sentienta Bridge before binding the configured port.

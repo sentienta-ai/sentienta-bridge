@@ -59,6 +59,27 @@ openclaw agents list
 python .\sentienta_bridge_v2.py --allow-root . --service local_fs --service openclaw_exec
 ```
 
+### Experimental native browser prototype
+
+The `codex/native-browser-prototype` branch includes an unreleased, visible native-browser service for governed Workflow testing. It uses a dedicated Chrome profile, accepts only structured `browser.*` commands, permits image attachment only from `--allow-root` paths, and does not publish without a separate approved `browser.submit` call.
+
+```powershell
+python .\sentienta_bridge_v2.py --bridge-id desktop_browser --allow-root C:\approved\content --service native_browser
+```
+
+### Temporary workflow compatibility shim
+
+During the 2026 CASA production freeze, the unreleased Native Browser Bridge
+accepts a narrow `fs.browser.*` alias so existing Core workflow tasks can test
+browser preparation without a Core deployment. The Bridge translates allowed
+aliases to `browser.*` and reports `native_browser` as the actual service.
+
+This is test-only compatibility behavior. `fs.browser.submit` is deliberately
+unsupported. The shim must be removed after Core gains a first-class governed
+`browser.*` workflow contract under Desktop Automation.
+
+This prototype is not part of the public production release.
+
 3. The Windows launcher enables Local File Services and OpenClaw and approves the bridge directory as the default Local File Services root. Use a different `--allow-root` only when you intentionally want to expose that trusted folder.
 4. The bridge prints a six-digit `PAIRING PASSCODE`. Keep the bridge running.
 5. In Sentienta, open **Account Settings > Connected Services > Sentienta Bridge**.
